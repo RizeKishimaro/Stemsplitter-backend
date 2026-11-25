@@ -7,6 +7,7 @@ use axum::{
     },
     response::Response,
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::StreamExt;
 use serde_json::json;
 use uuid::Uuid;
@@ -29,8 +30,18 @@ pub async fn create_job(
     if input.job_type != "separate" {
         return Err(AppError::BadRequest("job_type must be 'separate'".into()));
     }
-    let asset = sqlx::query_as::<_, (Uuid, i32, i64)>(
-        "SELECT project_id, sample_rate, frame_count FROM audio_assets WHERE id = $1",
+    if !["mix_first", "drums_first"].contains(&input.analysis_strategy.as_str()) {
+        return Err(AppError::BadRequest(
+            "analysis_strategy must be 'mix_first' or 'drums_first'".into(),
+        ));
+    }
+    if !(2..=12).contains(&input.beats_per_bar) {
+        return Err(AppError::BadRequest(
+            "beats_per_bar must be between 2 and 12".into(),
+        ));
+    }
+    let asset = sqlx::query_as::<_, (Uuid, i32, i16, i64)>(
+        "SELECT project_id, sample_rate, channels, frame_count FROM audio_assets WHERE id = $1",
     )
     .bind(input.audio_asset_id)
     .fetch_optional(&state.db)
@@ -43,12 +54,21 @@ pub async fn create_job(
     }
     let metadata = json!({
         "original_sample_rate": asset.1,
-        "original_frame_count": asset.2,
+        "original_channels": asset.2,
+        "original_frame_count": asset.3,
         "timing_authority": "integer_sample_positions",
-        "inference_executor": "scnet_cpu_not_yet_configured"
+        "inference_executor": "persistent_htdemucs_worker",
+        "source_mapping_policy": "whole_input_identity_sample_range"
+        ,"analysis_strategy": input.analysis_strategy
+        ,"quantization": {"unit": "bar", "beats_per_bar": input.beats_per_bar}
     });
-    let job = sqlx::query_as::<_, ProcessingJob>("INSERT INTO processing_jobs (project_id, audio_asset_id, job_type, request_metadata) VALUES ($1,$2,$3,$4) RETURNING *")
-        .bind(project_id).bind(input.audio_asset_id).bind(input.job_type).bind(metadata).fetch_one(&state.db).await?;
+    let ttl = ChronoDuration::from_std(state.config.audio_job_ttl)
+        .map_err(|_| AppError::Internal("audio TTL exceeds supported range".into()))?;
+    let expires_at = Utc::now() + ttl;
+    sqlx::query("UPDATE audio_assets SET expires_at = GREATEST(expires_at, $2), updated_at = now() WHERE id = $1")
+        .bind(input.audio_asset_id).bind(expires_at).execute(&state.db).await?;
+    let job = sqlx::query_as::<_, ProcessingJob>("INSERT INTO processing_jobs (project_id, audio_asset_id, job_type, request_metadata, expires_at) VALUES ($1,$2,$3,$4,$5) RETURNING *")
+        .bind(project_id).bind(input.audio_asset_id).bind(input.job_type).bind(metadata).bind(expires_at).fetch_one(&state.db).await?;
     state.jobs.emit(&job, Some("Queued".into()));
     Ok((axum::http::StatusCode::CREATED, Json(job)))
 }

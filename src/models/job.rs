@@ -55,6 +55,7 @@ pub struct ProcessingJob {
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -62,15 +63,40 @@ pub struct CreateJob {
     pub audio_asset_id: Uuid,
     #[serde(default = "default_job_type")]
     pub job_type: String,
+    /// Mix-first analyzes the original WAV before HTDemucs; drums-first analyzes HTDemucs drums.
+    #[serde(default = "default_analysis_strategy")]
+    pub analysis_strategy: String,
+    #[serde(default = "default_beats_per_bar")]
+    pub beats_per_bar: u8,
 }
 
 fn default_job_type() -> String {
     "separate".into()
 }
 
+fn default_analysis_strategy() -> String {
+    "drums_first".into()
+}
+fn default_beats_per_bar() -> u8 {
+    4
+}
+
 #[cfg(test)]
 mod tests {
-    use super::JobStatus;
+    use super::{CreateJob, JobStatus};
+
+    #[test]
+    fn separation_strategy_and_meter_are_additive_with_safe_defaults() {
+        let job: CreateJob = serde_json::from_value(
+            serde_json::json!({"audio_asset_id":"00000000-0000-4000-8000-000000000000"}),
+        )
+        .unwrap();
+        assert_eq!(job.analysis_strategy, "drums_first");
+        assert_eq!(job.beats_per_bar, 4);
+        let configured: CreateJob = serde_json::from_value(serde_json::json!({"audio_asset_id":"00000000-0000-4000-8000-000000000000","analysis_strategy":"mix_first","beats_per_bar":3})).unwrap();
+        assert_eq!(configured.analysis_strategy, "mix_first");
+        assert_eq!(configured.beats_per_bar, 3);
+    }
 
     #[test]
     fn job_lifecycle_allows_only_forward_transitions() {

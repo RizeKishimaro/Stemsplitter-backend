@@ -18,6 +18,7 @@ pub struct AudioAsset {
     pub duration_seconds: f64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

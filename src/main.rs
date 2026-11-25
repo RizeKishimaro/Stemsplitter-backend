@@ -7,7 +7,10 @@ mod state;
 
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::http::{HeaderValue, Method};
+use axum::{
+    Router,
+    http::{HeaderValue, Method},
+};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -35,6 +38,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Arc::new(Config::from_env().map_err(std::io::Error::other)?);
+    // RTen reads this once when its shared Rayon pool is first initialized.
+    // Bound its CPU workers independently from Tokio's blocking pool.
+    unsafe { std::env::set_var("RTEN_NUM_THREADS", config.beat_this_threads.to_string()) };
+    tracing::info!(
+        threads = config.beat_this_threads,
+        "configured Beat This RTen CPU workers"
+    );
     storage::prepare_root(&config.upload_dir).await?;
     let pool = PgPoolOptions::new()
         .max_connections(config.database_max_connections)
@@ -47,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool.clone(),
         events.clone(),
         config.job_poll_interval,
-        config.job_concurrency,
+        config.clone(),
     ));
     let requeued = manager.recover_interrupted().await?;
     tracing::info!(requeued_jobs = requeued, "recovered interrupted jobs");
@@ -66,12 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_origin(origins)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any);
-    let app = axum::Router::new()
+    let app: Router = axum::Router::new()
         .nest("/api/v1", routes::router(state, config.max_upload_bytes))
         .merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", routes::ApiDoc::openapi()))
         .layer(cors);
-    let listener = TcpListener::bind(config.address).await?;
-    tracing::info!(address = %config.address, concurrency = config.job_concurrency, "SonicLab Rust API listening");
+    let listener: TcpListener = TcpListener::bind(config.address).await?;
+    tracing::info!(address = %config.address, concurrency = config.job_concurrency, "DubPad API listening");
     serve(listener, app, manager).await?;
     Ok(())
 }

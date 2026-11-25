@@ -4,6 +4,7 @@ use axum::{
     Json,
     extract::{Multipart, Path as AxumPath, State, multipart::MultipartRejection},
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
 use sqlx::FromRow;
 use tokio::{fs, io::AsyncWriteExt};
@@ -29,6 +30,7 @@ pub struct AudioListItem {
     pub duration_seconds: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[utoipa::path(get, path = "/api/v1/projects/{project_id}/audio", params(("project_id" = Uuid, Path, description = "Project UUID")), responses((status = 200, description = "Audio metadata list")))]
@@ -46,7 +48,7 @@ pub async fn list_audio(
     if !exists {
         return Err(AppError::NotFound);
     }
-    let rows = sqlx::query_as::<_, AudioListItem>("SELECT id, project_id, original_filename, content_type, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at FROM audio_assets WHERE project_id = $1 ORDER BY created_at DESC")
+    let rows = sqlx::query_as::<_, AudioListItem>("SELECT id, project_id, original_filename, content_type, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at, expires_at FROM audio_assets WHERE project_id = $1 ORDER BY created_at DESC")
         .bind(project_id).fetch_all(&state.db).await?;
     Ok(Json(rows))
 }
@@ -223,12 +225,15 @@ pub async fn upload_audio(
     let asset_id =
         asset_id.ok_or_else(|| AppError::BadRequest("The file field is required".into()))?;
     fs::rename(&path, &destination_path).await?;
-    let result = sqlx::query_as::<_, AudioAsset>("INSERT INTO audio_assets (id, project_id, original_filename, content_type, stored_path, file_size_bytes, sample_rate, channels, frame_count, duration_seconds) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, project_id, original_filename, content_type, stored_path, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at")
+    let expires_at = Utc::now()
+        + ChronoDuration::from_std(state.config.audio_job_ttl)
+            .map_err(|_| AppError::Internal("audio TTL exceeds supported range".into()))?;
+    let result = sqlx::query_as::<_, AudioAsset>("INSERT INTO audio_assets (id, project_id, original_filename, content_type, stored_path, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id, project_id, original_filename, content_type, stored_path, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at, expires_at")
         .bind(asset_id)
         .bind(project_id).bind(filename).bind(content_type).bind(destination_path.to_string_lossy().to_string())
         .bind(file_size_bytes)
         .bind(validated.sample_rate as i32).bind(validated.channels as i16).bind(validated.frame_count as i64)
-        .bind(validated.duration_seconds()).fetch_one(&state.db).await;
+        .bind(validated.duration_seconds()).bind(expires_at).fetch_one(&state.db).await;
     match result {
         Ok(asset) => Ok(Json(asset)),
         Err(error) => {

@@ -63,7 +63,7 @@ pub async fn get_project(
     .fetch_optional(&state.db)
     .await?
     .ok_or(AppError::NotFound)?;
-    let audio_assets = sqlx::query_as::<_, AudioAsset>("SELECT id, project_id, original_filename, content_type, stored_path, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at FROM audio_assets WHERE project_id = $1 ORDER BY created_at")
+    let audio_assets = sqlx::query_as::<_, AudioAsset>("SELECT id, project_id, original_filename, content_type, stored_path, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at, expires_at FROM audio_assets WHERE project_id = $1 ORDER BY created_at")
         .bind(project_id).fetch_all(&state.db).await?;
     let jobs = sqlx::query_as::<_, ProcessingJob>(
         "SELECT * FROM processing_jobs WHERE project_id = $1 ORDER BY created_at DESC",

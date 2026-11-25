@@ -1,7 +1,10 @@
 pub mod audio;
+pub mod beat_analysis;
+pub mod chunks;
 pub mod health;
 pub mod jobs;
 pub mod projects;
+pub mod stems;
 
 use axum::{
     Router,
@@ -14,17 +17,31 @@ use utoipa::OpenApi;
 use crate::{services::job_manager::JobEvent, state::AppState};
 
 #[derive(OpenApi)]
-#[openapi(paths(
-    health::health,
-    projects::create_project,
-    projects::get_project,
-    audio::upload_audio,
-    audio::list_audio,
-    jobs::create_job,
-    jobs::get_job,
-    jobs::cancel_job,
-    jobs::job_events
-))]
+#[openapi(
+    info(
+        title = "DubPad API",
+        version = "1.0.0",
+        description = "API for DubPad projects, local audio uploads, HTDemucs stem separation, and beat analysis."
+    ),
+    paths(
+        health::health,
+        projects::create_project,
+        projects::get_project,
+        audio::upload_audio,
+        audio::list_audio,
+        jobs::create_job,
+        jobs::get_job,
+        jobs::cancel_job,
+        jobs::job_events,
+        stems::list_stems,
+        stems::get_stem,
+        chunks::list_chunks,
+        chunks::get_chunk_stem,
+        beat_analysis::create_beat_analysis,
+        beat_analysis::get_beat_analysis
+    ),
+    components(schemas(crate::models::beat_analysis::BeatAnalysisJob))
+)]
 pub struct ApiDoc;
 
 pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
@@ -43,6 +60,17 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/events", get(jobs::job_events))
+        .route("/jobs/{job_id}/stems", get(stems::list_stems))
+        .route("/jobs/{job_id}/stems/{stem_name}", get(stems::get_stem))
+        .route("/jobs/{job_id}/chunks", get(chunks::list_chunks))
+        .route(
+            "/jobs/{job_id}/chunks/{chunk_index}/stems/{stem_name}",
+            get(chunks::get_chunk_stem),
+        )
+        .route(
+            "/jobs/{job_id}/beat-analysis",
+            post(beat_analysis::create_beat_analysis).get(beat_analysis::get_beat_analysis),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -50,4 +78,34 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
 pub fn event_channel() -> tokio::sync::broadcast::Sender<JobEvent> {
     let (sender, _) = tokio::sync::broadcast::channel(256);
     sender
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn openapi_has_dubpad_branding_and_separate_beat_analysis_paths() {
+        let document = ApiDoc::openapi();
+        assert_eq!(document.info.title, "DubPad API");
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/v1/jobs/{job_id}/beat-analysis")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/v1/jobs/{job_id}/chunks")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/v1/jobs/{job_id}/chunks/{chunk_index}/stems/{stem_name}")
+        );
+    }
 }
