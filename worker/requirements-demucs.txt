@@ -1,0 +1,9 @@
+# Direct third-party imports used by worker/demucs_worker.py.
+# Versions reflect the working Demucs runtime verified during implementation.
+torch==2.15.0
+demucs==4.1.0
+numpy==2.5.4
+julius==0.2.8
+soundfile==0.14.0
+huggingface-hub==2.4.0
+PyYAML==6.0.3
