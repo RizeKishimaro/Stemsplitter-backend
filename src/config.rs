@@ -1,4 +1,11 @@
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Command,
+    str::FromStr,
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -24,6 +31,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         dotenvy::dotenv().ok();
+        let application_root = application_root()?;
         let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
         let port = value("PORT", 8787_u16)?;
         let address = SocketAddr::from_str(&format!("{host}:{port}"))
@@ -68,6 +76,26 @@ impl Config {
             .map(str::to_string)
             .collect();
 
+        let demucs_python = resolve_demucs_python(&application_root)?;
+        let demucs_worker_script = resolve_app_path(
+            env::var_os("DEMUCS_WORKER_SCRIPT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("worker/demucs_worker.py")),
+            &application_root,
+        );
+        let beat_this_mel_model = resolve_app_path(
+            env::var_os("BEAT_THIS_MEL_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("models/mel_spectrogram.onnx")),
+            &application_root,
+        );
+        let beat_this_model = resolve_app_path(
+            env::var_os("BEAT_THIS_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("models/beat_this.onnx")),
+            &application_root,
+        );
+
         Ok(Self {
             address,
             database_url,
@@ -79,14 +107,8 @@ impl Config {
             job_concurrency,
             job_poll_interval: Duration::from_millis(poll_ms),
             cors_allow_origins,
-            demucs_python: PathBuf::from(
-                env::var("DEMUCS_PYTHON")
-                    .unwrap_or_else(|_| "/home/rizekishimaro/.venvs/demucs/bin/python".into()),
-            ),
-            demucs_worker_script: PathBuf::from(
-                env::var("DEMUCS_WORKER_SCRIPT")
-                    .unwrap_or_else(|_| "./worker/demucs_worker.py".into()),
-            ),
+            demucs_python,
+            demucs_worker_script,
             demucs_cancel_timeout: Duration::from_secs(value(
                 "DEMUCS_CANCEL_TIMEOUT_SECS",
                 60_u64,
@@ -95,13 +117,8 @@ impl Config {
                 "DEMUCS_STARTUP_TIMEOUT_SECS",
                 600_u64,
             )?),
-            beat_this_mel_model: PathBuf::from(
-                env::var("BEAT_THIS_MEL_MODEL")
-                    .unwrap_or_else(|_| "./models/mel_spectrogram.onnx".into()),
-            ),
-            beat_this_model: PathBuf::from(
-                env::var("BEAT_THIS_MODEL").unwrap_or_else(|_| "./models/beat_this.onnx".into()),
-            ),
+            beat_this_mel_model,
+            beat_this_model,
             beat_this_model_version: env::var("BEAT_THIS_MODEL_VERSION")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -111,11 +128,132 @@ impl Config {
     }
 }
 
+fn application_root() -> Result<PathBuf, String> {
+    let root = if let Some(root) = env::var_os("DUBPAD_APP_ROOT") {
+        PathBuf::from(root)
+    } else {
+        env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.ancestors().find_map(|ancestor| {
+                    (ancestor.join("worker/demucs_worker.py").is_file()
+                        && ancestor.join("scripts/setup_demucs_runtime.py").is_file())
+                    .then(|| ancestor.to_path_buf())
+                })
+            })
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    };
+    root.canonicalize().map_err(|error| {
+        format!(
+            "Could not resolve DubPad application root {}: {error}",
+            root.display()
+        )
+    })
+}
+
+fn resolve_app_path(path: PathBuf, application_root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        application_root.join(path)
+    }
+}
+
+fn resolve_demucs_python(application_root: &Path) -> Result<PathBuf, String> {
+    let setup_script = application_root.join("scripts/setup_demucs_runtime.py");
+    let configured_bootstrap = env::var_os("DEMUCS_PYTHON").and_then(|value| {
+        let configured = PathBuf::from(value);
+        if configured.is_absolute() || configured.components().count() > 1 {
+            let path = if configured.is_absolute() {
+                configured
+            } else {
+                application_root.join(configured)
+            };
+            path.is_file().then_some(path)
+        } else {
+            find_on_path(configured.to_str()?)
+        }
+    });
+    let bootstrap_python = configured_bootstrap.or_else(|| {
+        ["python3", "python"]
+        .into_iter()
+        .find_map(|name| find_on_path(name))
+    }).ok_or_else(|| {
+            "Python 3 is required to detect or set up the Demucs runtime. Install Python 3 or set DEMUCS_PYTHON to an existing interpreter.".to_string()
+        })?;
+    let output = Command::new(&bootstrap_python)
+        .arg(&setup_script)
+        .arg("--ensure")
+        .arg("--json")
+        .current_dir(application_root)
+        .output()
+        .map_err(|error| format!("Could not run Demucs runtime setup script: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Demucs Python setup failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Demucs setup returned invalid JSON: {error}"))?;
+    let python = result
+        .get("python")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "Demucs setup response did not include the selected Python path".to_string()
+        })?;
+    let action = result
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("resolved");
+    let report = result
+        .get("report")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    tracing::info!(python, action, report, "Demucs Python runtime configured");
+    Ok(PathBuf::from(python))
+}
+
+fn find_on_path(executable: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|directory| directory.join(executable))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
 fn value<T: FromStr>(key: &str, default: T) -> Result<T, String> {
     match env::var(key) {
         Ok(value) => value
             .parse()
             .map_err(|_| format!("{key} has an invalid value")),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::resolve_app_path;
+
+    #[test]
+    fn relative_worker_and_model_paths_are_anchored_to_app_root() {
+        let root = Path::new("/opt/dubpad");
+        assert_eq!(
+            resolve_app_path("worker/demucs_worker.py".into(), root),
+            root.join("worker/demucs_worker.py")
+        );
+    }
+
+    #[test]
+    fn absolute_worker_and_model_overrides_are_preserved() {
+        let path = Path::new("/srv/models/beat.onnx");
+        assert_eq!(
+            resolve_app_path(path.to_path_buf(), Path::new("/opt/dubpad")),
+            path
+        );
     }
 }

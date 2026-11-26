@@ -5,6 +5,7 @@ mod routes;
 mod services;
 mod state;
 
+use core::fmt;
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -81,6 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api/v1/openapi.json", routes::ApiDoc::openapi()))
         .layer(cors);
     let listener: TcpListener = TcpListener::bind(config.address).await?;
+    println!("{}", config.address);
+
     tracing::info!(address = %config.address, concurrency = config.job_concurrency, "DubPad API listening");
     serve(listener, app, manager).await?;
     Ok(())

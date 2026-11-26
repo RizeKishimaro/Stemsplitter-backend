@@ -11,6 +11,7 @@
 /data/uploads/
 /data/jobs/
 /data/projects/
+/data/runtime/
 
 # Local model binaries
 /models/*.onnx
