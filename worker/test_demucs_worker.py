@@ -1,6 +1,8 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
@@ -35,16 +37,40 @@ class AudioIntegrityTests(unittest.TestCase):
                 peak = int(torch.argmax(restored[0]).item())
                 self.assertLessEqual(abs(peak - 1200), 2)
 
-    def test_decoded_metadata_must_match_expected_source_and_channel_layout(self):
+    def test_decoded_sample_rate_is_authoritative_and_channels_remain_validated(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "source.wav"
             sf.write(path, np.zeros((441, 2), dtype=np.float32), 44_100)
-            self.assertEqual(validate_metadata(path, {"sample_rate": 44_100, "channels": 2, "frame_count": 441}),
+            self.assertEqual(validate_metadata(path, {"sample_rate": 48_000, "channels": 2, "frame_count": 441}),
                              {"sample_rate": 44_100, "channels": 2, "frame_count": 441})
-            with self.assertRaisesRegex(ValueError, "frame_count"):
-                validate_metadata(path, {"sample_rate": 44_100, "channels": 2, "frame_count": 440})
             with self.assertRaisesRegex(ValueError, "channels"):
-                validate_metadata(path, {"sample_rate": 44_100, "channels": 1, "frame_count": 441})
+                validate_metadata(path, {"sample_rate": 48_000, "channels": 1, "frame_count": 441})
+
+    def test_decoded_sample_rate_must_be_within_supported_limits(self):
+        expected = {"sample_rate": 48_000, "channels": 2, "frame_count": 10}
+        for rate in (7_999, 384_001):
+            with self.subTest(rate=rate), patch(
+                "soundfile.info",
+                return_value=SimpleNamespace(samplerate=rate, channels=2, frames=10),
+            ):
+                with self.assertRaisesRegex(ValueError, "8000 and 384000"):
+                    validate_metadata("unused.wav", expected)
+
+        for rate in (8_000, 384_000):
+            with self.subTest(rate=rate), patch(
+                "soundfile.info",
+                return_value=SimpleNamespace(samplerate=rate, channels=2, frames=10),
+            ):
+                actual = validate_metadata("unused.wav", expected)
+                self.assertEqual(actual["sample_rate"], rate)
+
+    def test_same_rate_path_does_not_resample_or_change_frame_count(self):
+        wave = torch.zeros(2, 32)
+        result, adjustment = resample_exact(wave, 44_100, 44_100, 32)
+        self.assertIs(result, wave)
+        self.assertEqual(adjustment, 0)
+        with self.assertRaisesRegex(ValueError, "same-rate audio"):
+            resample_exact(wave, 44_100, 44_100, 31)
 
 
 if __name__ == "__main__":

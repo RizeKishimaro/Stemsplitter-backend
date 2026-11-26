@@ -155,6 +155,14 @@ def resample_exact(wave, source_rate, target_rate, frames):
     import julius
     import torch
 
+    if source_rate == target_rate:
+        if int(wave.shape[-1]) != frames:
+            raise ValueError(
+                "same-rate audio must retain its decoded frame count "
+                f"({int(wave.shape[-1])} != {frames})"
+            )
+        return wave, 0
+
     converted = julius.resample_frac(
         wave,
         source_rate,
@@ -186,23 +194,24 @@ def validate_metadata(path, expected):
         "frame_count": int(info.frames),
     }
 
-    # Sample rate and channel count must match the upload metadata.
-    # Frame count can differ because browser and native MP3 decoders
-    # may interpret encoder delay and padding differently.
-    for key in ("sample_rate", "channels"):
-        if int(expected[key]) != actual[key]:
-            raise ValueError(
-                f"Audio metadata mismatch for {key}: "
-                f"expected {expected[key]}, decoded {actual[key]}"
-            )
-
     if (
-        actual["sample_rate"] <= 0
+        not 8_000 <= actual["sample_rate"] <= 384_000
         or actual["frame_count"] <= 0
         or actual["channels"] not in (1, 2)
     ):
         raise ValueError(
-            "Only non-empty mono or stereo audio with a positive sample rate is supported"
+            "Only non-empty mono or stereo audio with a sample rate "
+            "between 8000 and 384000 Hz is supported"
+        )
+
+    # The browser's sample rate describes its decoded AudioBuffer, which may
+    # differ from the encoded source rate. Keep channel layout validation
+    # strict, but use the decoded file header as the source-rate authority.
+    expected_channels = int(expected["channels"])
+    if expected_channels != actual["channels"]:
+        raise ValueError(
+            f"Audio metadata mismatch for channels: "
+            f"expected {expected_channels}, decoded {actual['channels']}"
         )
 
     return actual

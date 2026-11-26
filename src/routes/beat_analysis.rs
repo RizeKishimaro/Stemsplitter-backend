@@ -452,20 +452,34 @@ fn validate_wav_metadata(
     expected_channels: u16,
     expected_frames: u64,
 ) -> Result<(), String> {
-    let wav = hound::WavReader::open(path)
-        .map_err(|error| format!("drums WAV header could not be read: {error}"))?;
-    let spec = wav.spec();
-    let actual_frames = u64::from(wav.duration());
-    if spec.sample_rate != expected_sample_rate
-        || spec.channels != expected_channels
+    let (actual_sample_rate, actual_channels, actual_frames) = read_wav_metadata(path)?;
+    if actual_sample_rate != expected_sample_rate
+        || actual_channels != expected_channels
         || actual_frames != expected_frames
     {
         return Err(format!(
-            "drums WAV header ({}, {} channels, {actual_frames} frames) differs from separation metadata ({expected_sample_rate}, {expected_channels} channels, {expected_frames} frames)",
-            spec.sample_rate, spec.channels
+            "drums WAV header ({actual_sample_rate}, {actual_channels} channels, {actual_frames} frames) differs from separation metadata ({expected_sample_rate}, {expected_channels} channels, {expected_frames} frames)"
         ));
     }
     Ok(())
+}
+
+/// Read actual WAV source metadata for analysis paths that run before HTDemucs.
+pub(crate) fn read_wav_metadata(path: &std::path::Path) -> Result<(u32, u16, u64), String> {
+    let wav = hound::WavReader::open(path)
+        .map_err(|error| format!("source WAV header could not be read: {error}"))?;
+    let spec = wav.spec();
+    let actual_frames = u64::from(wav.duration());
+    if !(8_000..=384_000).contains(&spec.sample_rate)
+        || !(1..=2).contains(&spec.channels)
+        || actual_frames == 0
+    {
+        return Err(format!(
+            "source WAV has unsupported metadata: {} Hz, {} channels, {actual_frames} frames",
+            spec.sample_rate, spec.channels,
+        ));
+    }
+    Ok((spec.sample_rate, spec.channels, actual_frames))
 }
 
 fn normalize_mono_frame(channel_sum: f64, channels: u16, normalization: f64) -> f32 {

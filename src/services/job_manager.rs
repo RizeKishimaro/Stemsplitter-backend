@@ -322,6 +322,25 @@ impl JobManager {
             .and_then(Value::as_str)
             == Some("mix_first")
         {
+            let mix_path = std::path::PathBuf::from(&stored_path);
+            let source_metadata = tokio::task::spawn_blocking({
+                let mix_path = mix_path.clone();
+                move || crate::routes::beat_analysis::read_wav_metadata(&mix_path)
+            })
+            .await;
+            let (mix_sample_rate, mix_channels, mix_frame_count) = match source_metadata {
+                Ok(Ok(metadata)) => metadata,
+                Ok(Err(error)) => {
+                    self.fail(job.id, format!("mix-first source metadata failed: {error}"))
+                        .await;
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.fail(job.id, format!("mix-first metadata task failed: {error}"))
+                        .await;
+                    return Ok(());
+                }
+            };
             self.emit_named(
                 job.id,
                 "beat_analysis.started",
@@ -329,19 +348,18 @@ impl JobManager {
             )
             .await;
             if let Err(error) = sqlx::query("INSERT INTO beat_analyses (separation_job_id,status,input_stem,sample_rate,channels,frame_count,model_version) VALUES ($1,'RUNNING','mix',$2,$3,$4,$5)")
-                .bind(job.id).bind(sample_rate).bind(channels).bind(frame_count).bind(&self.config.beat_this_model_version).execute(&self.db).await {
+                .bind(job.id).bind(mix_sample_rate as i32).bind(mix_channels as i16).bind(mix_frame_count as i64).bind(&self.config.beat_this_model_version).execute(&self.db).await {
                 self.fail(job.id, format!("could not create mix analysis state: {error}")).await; return Ok(());
             }
-            let mix_path = std::path::PathBuf::from(&stored_path);
             let mel = self.config.beat_this_mel_model.clone();
             let model = self.config.beat_this_model.clone();
             let version = self.config.beat_this_model_version.clone();
             let mix_analysis = tokio::task::spawn_blocking(move || {
                 crate::routes::beat_analysis::analyze_wav(
                     &mix_path,
-                    sample_rate as u32,
-                    channels as u16,
-                    frame_count as u64,
+                    mix_sample_rate,
+                    mix_channels,
+                    mix_frame_count,
                     "mix",
                     &mel,
                     &model,
@@ -596,29 +614,8 @@ impl JobManager {
         let project_id = job.project_id;
         let job_id = job.id;
 
-        let original = worker_result
-            .get("original")
-            .ok_or("worker result is missing original audio metadata")?;
-
-        let sample_rate_i32 = original
-            .get("sample_rate")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok())
-            .filter(|value| (8_000..=384_000).contains(value))
-            .ok_or("worker returned an invalid original sample rate")?;
-
-        let channels_i16 = original
-            .get("channels")
-            .and_then(Value::as_i64)
-            .and_then(|value| i16::try_from(value).ok())
-            .filter(|value| (1..=2).contains(value))
-            .ok_or("worker returned an invalid original channel count")?;
-
-        let frame_count_i64 = original
-            .get("frame_count")
-            .and_then(Value::as_i64)
-            .filter(|value| *value > 0)
-            .ok_or("worker returned an invalid original frame count")?;
+        let (sample_rate_i32, channels_i16, frame_count_i64) =
+            worker_source_metadata(&worker_result)?;
 
         let sample_rate = sample_rate_i32 as u32;
         let channels = channels_i16 as u16;
@@ -868,8 +865,8 @@ impl JobManager {
         sqlx::query("UPDATE beat_analyses SET status='SUCCEEDED',result=$2,error_message=NULL,finished_at=now(),updated_at=now() WHERE id=$1")
             .bind(analysis_id).bind(&beat_grid).execute(&mut *tx).await
             .map_err(|error| format!("persist beat-grid JSON: {error}"))?;
-        let completed_job = sqlx::query_as::<_, ProcessingJob>("UPDATE processing_jobs SET status='SUCCEEDED',cancel_requested=false,progress=100,result_metadata=$2,finished_at=now(),expires_at=NULL,updated_at=now() WHERE id=$1 AND status='RUNNING' RETURNING *")
-            .bind(job_id).bind(&result_metadata).fetch_optional(&mut *tx).await
+        let completed_job = sqlx::query_as::<_, ProcessingJob>("UPDATE processing_jobs SET status='SUCCEEDED',cancel_requested=false,progress=100,result_metadata=$2,request_metadata=request_metadata || jsonb_build_object('original_sample_rate',$3::integer,'original_channels',$4::integer,'original_frame_count',$5::bigint),finished_at=now(),expires_at=NULL,updated_at=now() WHERE id=$1 AND status='RUNNING' RETURNING *")
+            .bind(job_id).bind(&result_metadata).bind(sample_rate_i32).bind(channels_i16).bind(frame_count_i64).fetch_optional(&mut *tx).await
             .map_err(|error| format!("persist completed separation job: {error}"))?
             .ok_or("job stopped running before persistent outputs were committed")?;
         tx.commit()
@@ -991,6 +988,30 @@ fn worker_restart_delay(attempt: u32) -> Duration {
     Duration::from_secs(1_u64 << exponent).min(Duration::from_secs(30))
 }
 
+fn worker_source_metadata(worker_result: &Value) -> Result<(i32, i16, i64), String> {
+    let original = worker_result
+        .get("original")
+        .ok_or("worker result is missing original audio metadata")?;
+    let sample_rate = original
+        .get("sample_rate")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| (8_000..=384_000).contains(value))
+        .ok_or("worker returned an invalid original sample rate")?;
+    let channels = original
+        .get("channels")
+        .and_then(Value::as_i64)
+        .and_then(|value| i16::try_from(value).ok())
+        .filter(|value| (1..=2).contains(value))
+        .ok_or("worker returned an invalid original channel count")?;
+    let frames = original
+        .get("frame_count")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or("worker returned an invalid original frame count")?;
+    Ok((sample_rate, channels, frames))
+}
+
 fn worker_progress(progress: f64) -> f64 {
     if !progress.is_finite() {
         return 0.0;
@@ -1101,7 +1122,10 @@ async fn remove_new_assets(paths: &[std::path::PathBuf]) {
 
 #[cfg(test)]
 mod dispatch_tests {
-    use super::{build_beat_grid, claim_queued, worker_progress, worker_restart_delay};
+    use super::{
+        build_beat_grid, claim_queued, worker_progress, worker_restart_delay,
+        worker_source_metadata,
+    };
     use sqlx::postgres::PgPoolOptions;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1123,6 +1147,23 @@ mod dispatch_tests {
         let inference = worker_progress(100.0);
         assert_eq!(inference, 97.0);
         assert_eq!(worker_progress(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn finalization_uses_worker_decoded_source_metadata() {
+        let result = serde_json::json!({
+            "original": {"sample_rate": 44_100, "channels": 2, "frame_count": 441_000}
+        });
+        assert_eq!(
+            worker_source_metadata(&result).unwrap(),
+            (44_100, 2, 441_000)
+        );
+        assert!(
+            worker_source_metadata(&serde_json::json!({
+                "original": {"sample_rate": 7_999, "channels": 2, "frame_count": 441_000}
+            }))
+            .is_err()
+        );
     }
 
     #[test]
