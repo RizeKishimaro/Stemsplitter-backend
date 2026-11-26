@@ -1,18 +1,9 @@
-
-
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    path::Path,
-    process::Command,
-};
-use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
-};
+use std::{fs, path::Path, process::Command};
+use tokio::{fs::File, io::AsyncWriteExt};
 
 const BEAT_THIS_RELEASE: &str =
     "https://github.com/danigb/beat-this-rs/releases/download/model-large";
@@ -27,7 +18,10 @@ async fn download_file(url: &str, destination: &Path) -> Result<()> {
 
     let temporary = destination.with_extension(format!(
         "{}.part",
-        destination.extension().and_then(|ext| ext.to_str()).unwrap_or("download")
+        destination
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("download")
     ));
 
     let client = reqwest::Client::builder()
@@ -105,9 +99,7 @@ async fn download_file(url: &str, destination: &Path) -> Result<()> {
 }
 
 async fn download_text(url: &str) -> Result<String> {
-    let response = reqwest::get(url)
-        .await?
-        .error_for_status()?;
+    let response = reqwest::get(url).await?.error_for_status()?;
 
     Ok(response.text().await?)
 }
@@ -152,11 +144,7 @@ async fn download_beat_model(models_dir: &Path) -> Result<()> {
         println!("Existing Beat This model failed checksum. Replacing it.");
     }
 
-    download_file(
-        &format!("{BEAT_THIS_RELEASE}/beat_this.onnx"),
-        &destination,
-    )
-    .await?;
+    download_file(&format!("{BEAT_THIS_RELEASE}/beat_this.onnx"), &destination).await?;
 
     let actual = sha256(&destination).await?;
 
@@ -175,9 +163,7 @@ async fn download_mel_model(models_dir: &Path) -> Result<()> {
 
     println!("\nBeat This mel-spectrogram model");
 
-    if destination.is_file()
-        && tokio::fs::metadata(&destination).await?.len() > 0
-    {
+    if destination.is_file() && tokio::fs::metadata(&destination).await?.len() > 0 {
         println!("Existing mel model found. Reusing it.");
         return Ok(());
     }
@@ -239,8 +225,6 @@ print(f"Verified checkpoints: {len(signatures)}")
     Ok(())
 }
 
-
-
 pub async fn setup(root: &Path) -> Result<()> {
     let runtime = super::runtime::setup(root)?;
     setup_with_python(root, Path::new(&runtime.python)).await
@@ -263,4 +247,3 @@ pub async fn setup_with_python(root: &Path, python: &Path) -> Result<()> {
 
     Ok(())
 }
-
