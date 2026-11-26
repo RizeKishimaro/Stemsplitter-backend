@@ -176,18 +176,20 @@ def resample_exact(wave, source_rate, target_rate, frames):
 
 
 def validate_metadata(path, expected):
-    """Validate the input audio file's actual metadata."""
+    """Validate source metadata while treating decoded frames as authoritative."""
     import soundfile as sf
 
     info = sf.info(path)
-
     actual = {
         "sample_rate": int(info.samplerate),
         "channels": int(info.channels),
         "frame_count": int(info.frames),
     }
 
-    for key in ("sample_rate", "channels", "frame_count"):
+    # Sample rate and channel count must match the upload metadata.
+    # Frame count can differ because browser and native MP3 decoders
+    # may interpret encoder delay and padding differently.
+    for key in ("sample_rate", "channels"):
         if int(expected[key]) != actual[key]:
             raise ValueError(
                 f"Audio metadata mismatch for {key}: "
@@ -250,14 +252,30 @@ def process(separator, command):
                 streams=0,
                 samplerate=actual["sample_rate"],
             )
+        diagnostic = {
+            "job_id": job_id,
+            "soundfile_sample_rate": actual["sample_rate"],
+            "soundfile_channels": actual["channels"],
+            "soundfile_frames": actual["frame_count"],
+            "audiofile_shape": list(source.shape),
+        }
 
-        if source.shape[-1] != actual["frame_count"] or source.shape[0] != 2:
+        diagnostic_path = Path("/tmp") / f"dubpad-decoder-{job_id}.json"
+        diagnostic_path.write_text(
+            json.dumps(diagnostic, indent=2),
+            encoding="utf-8",
+        )
+
+        # AudioFile's decoded waveform is the authoritative timeline
+        # because this exact waveform is passed to HTDemucs.
+        if source.ndim != 2 or source.shape[0] != 2:
             raise ValueError(
-                "Decoded waveform frame count/channel count differs "
-                "from validated source metadata"
+                f"Decoded waveform must be stereo; got shape {tuple(source.shape)}"
             )
 
-        # ---------------------------------------------------------
+        actual["frame_count"] = int(
+            source.shape[-1]
+        )  # ---------------------------------------------------------
         # 3. Resample source audio to the HTDemucs sample rate.
         # ---------------------------------------------------------
 

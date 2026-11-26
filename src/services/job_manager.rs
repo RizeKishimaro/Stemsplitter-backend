@@ -585,7 +585,7 @@ impl JobManager {
     async fn finalize_stems_inner(
         &self,
         job: &ProcessingJob,
-        _worker_result: Value,
+        worker_result: Value,
         attempt_dir: &std::path::Path,
         original_path: &str,
         original_filename: &str,
@@ -596,20 +596,33 @@ impl JobManager {
         let project_id = job.project_id;
         let job_id = job.id;
 
-        let original = sqlx::query_as::<_, (i32, i16, i64)>(
-            "SELECT sample_rate, channels, frame_count FROM audio_assets WHERE id=$1",
-        )
-        .bind(job.audio_asset_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|error| format!("read original audio metadata: {error}"))?;
-        let (sample_rate_i32, channels_i16, frame_count_i64) = original;
-        let sample_rate = u32::try_from(sample_rate_i32)
-            .map_err(|_| "original audio has an invalid sample rate".to_owned())?;
-        let channels = u16::try_from(channels_i16)
-            .map_err(|_| "original audio has an invalid channel count".to_owned())?;
-        let frame_count = u64::try_from(frame_count_i64)
-            .map_err(|_| "original audio has an invalid frame count".to_owned())?;
+        let original = worker_result
+            .get("original")
+            .ok_or("worker result is missing original audio metadata")?;
+
+        let sample_rate_i32 = original
+            .get("sample_rate")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| (8_000..=384_000).contains(value))
+            .ok_or("worker returned an invalid original sample rate")?;
+
+        let channels_i16 = original
+            .get("channels")
+            .and_then(Value::as_i64)
+            .and_then(|value| i16::try_from(value).ok())
+            .filter(|value| (1..=2).contains(value))
+            .ok_or("worker returned an invalid original channel count")?;
+
+        let frame_count_i64 = original
+            .get("frame_count")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("worker returned an invalid original frame count")?;
+
+        let sample_rate = sample_rate_i32 as u32;
+        let channels = channels_i16 as u16;
+        let frame_count = frame_count_i64 as u64;
         let duration_seconds = frame_count as f64 / f64::from(sample_rate);
 
         self.stage_progress(
@@ -833,10 +846,22 @@ impl JobManager {
                 .execute(&mut *tx).await.map_err(|error| format!("persist project stem reference: {error}"))?;
         }
         sqlx::query(
-            "UPDATE audio_assets SET stored_path=$2,expires_at=NULL,updated_at=now() WHERE id=$1",
+            "UPDATE audio_assets
+ SET stored_path=$2,
+     sample_rate=$3,
+     channels=$4,
+     frame_count=$5,
+     duration_seconds=$6,
+     expires_at=NULL,
+     updated_at=now()
+ WHERE id=$1",
         )
         .bind(job.audio_asset_id)
         .bind(original_destination.to_string_lossy().to_string())
+        .bind(sample_rate_i32)
+        .bind(channels_i16)
+        .bind(frame_count_i64)
+        .bind(duration_seconds)
         .execute(&mut *tx)
         .await
         .map_err(|error| format!("persist permanent original audio reference: {error}"))?;
