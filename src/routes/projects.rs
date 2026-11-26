@@ -12,6 +12,7 @@ use crate::{
         audio_asset::AudioAsset,
         job::ProcessingJob,
         project::{CreateProject, Project},
+        stem::ProjectStem,
     },
     state::AppState,
 };
@@ -21,6 +22,20 @@ pub struct ProjectDetails {
     project: Project,
     audio_assets: Vec<AudioAsset>,
     jobs: Vec<ProcessingJob>,
+    stems: Vec<ProjectStemView>,
+    beat_grid: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStemView {
+    name: String,
+    audio_url: String,
+    sample_rate: i32,
+    channels: i16,
+    frames: i64,
+    duration_seconds: f64,
+    file_size_bytes: i64,
 }
 
 #[utoipa::path(post, path = "/api/v1/projects", responses((status = 201, description = "Project created")))]
@@ -71,10 +86,39 @@ pub async fn get_project(
     .bind(project_id)
     .fetch_all(&state.db)
     .await?;
-    let _timing_contract: Value = serde_json::json!({ "authoritative_units": "integer_samples" });
+    let stem_rows = sqlx::query_as::<_, ProjectStem>("SELECT project_id,job_id,stem_name,storage_key,sample_rate,channels,frame_count,file_size_bytes,created_at FROM project_stems WHERE project_id=$1 ORDER BY stem_name")
+        .bind(project_id).fetch_all(&state.db).await?;
+    let stems = stem_rows
+        .into_iter()
+        .map(|stem| ProjectStemView {
+            audio_url: format!("/api/v1/projects/{project_id}/stems/{}", stem.stem_name),
+            name: stem.stem_name,
+            sample_rate: stem.sample_rate,
+            channels: stem.channels,
+            frames: stem.frame_count,
+            duration_seconds: stem.frame_count as f64 / f64::from(stem.sample_rate),
+            file_size_bytes: stem.file_size_bytes,
+        })
+        .collect();
+    let beat_grid = sqlx::query_scalar::<_, Value>("SELECT ba.result FROM beat_analyses ba JOIN processing_jobs j ON j.id=ba.separation_job_id WHERE j.project_id=$1 AND j.status='SUCCEEDED' AND ba.status='SUCCEEDED' ORDER BY ba.finished_at DESC NULLS LAST, ba.created_at DESC LIMIT 1")
+        .bind(project_id).fetch_optional(&state.db).await?;
     Ok(Json(ProjectDetails {
         project,
         audio_assets,
         jobs,
+        stems,
+        beat_grid,
     }))
+}
+
+#[utoipa::path(get, path = "/api/v1/projects/{project_id}/analysis", params(("project_id" = Uuid, Path, description = "Project UUID")), responses((status = 200, description = "Most recent saved project beat grid"), (status = 404, description = "Project or analysis not found")))]
+pub async fn get_project_analysis(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let project_id = Uuid::parse_str(&project_id)
+        .map_err(|_| AppError::BadRequest("project_id must be a UUID".into()))?;
+    let result = sqlx::query_scalar::<_, Value>("SELECT ba.result FROM beat_analyses ba JOIN processing_jobs j ON j.id=ba.separation_job_id WHERE j.project_id=$1 AND j.status='SUCCEEDED' AND ba.status='SUCCEEDED' ORDER BY ba.finished_at DESC NULLS LAST, ba.created_at DESC LIMIT 1")
+        .bind(project_id).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
+    Ok(Json(result))
 }

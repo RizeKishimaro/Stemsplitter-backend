@@ -20,7 +20,7 @@ use crate::{
     error::AppError,
     models::{
         job::ProcessingJob,
-        stem::{StemListResponse, StemMetadata},
+        stem::{ProjectStem, StemListResponse, StemMetadata},
     },
     services::storage,
     state::AppState,
@@ -45,8 +45,14 @@ pub async fn list_stems(
     let job_id = parse_job_id(&job_id)?;
     let job = get_job(&state, job_id).await?;
     require_succeeded(Some(job.status.as_str()))?;
-    let root = storage::jobs_root(&state.config.upload_dir);
-    let response = list_from_result(job_id, &job.status, &job.result_metadata, &root).await?;
+    let rows = sqlx::query_as::<_, ProjectStem>("SELECT project_id,job_id,stem_name,storage_key,sample_rate,channels,frame_count,file_size_bytes,created_at FROM project_stems WHERE job_id=$1 ORDER BY stem_name")
+        .bind(job_id).fetch_all(&state.db).await?;
+    let response = if rows.is_empty() {
+        let root = storage::jobs_root(&state.config.upload_dir);
+        list_from_result(job_id, &job.status, &job.result_metadata, &root).await?
+    } else {
+        project_stem_list(job_id, &job.status, rows)
+    };
     Ok(axum::Json(response))
 }
 
@@ -76,17 +82,79 @@ pub async fn get_stem(
     let stem_name = validate_stem_name(&stem_name)?;
     let job = get_job(&state, job_id).await?;
     require_succeeded(Some(job.status.as_str()))?;
-    let path = resolve_stem_file(
-        &storage::jobs_root(&state.config.upload_dir),
-        job_id,
-        stem_name,
-    )
-    .await?;
+    let path = if let Some(row) = sqlx::query_as::<_, ProjectStem>("SELECT project_id,job_id,stem_name,storage_key,sample_rate,channels,frame_count,file_size_bytes,created_at FROM project_stems WHERE job_id=$1 AND stem_name=$2")
+        .bind(job_id).bind(stem_name).fetch_optional(&state.db).await? {
+        resolve_project_stem(&state, &row).await?
+    } else {
+        resolve_stem_file(
+            &storage::jobs_root(&state.config.upload_dir),
+            job_id,
+            stem_name,
+        )
+        .await?
+    };
     let range_header = headers
         .get(header::RANGE)
         .map(|value| value.to_str().unwrap_or(""));
     let lease = storage::acquire_audio_stream(job_id).ok_or(AppError::NotFound)?;
     stream_stem_with_lease(&path, range_header, Some(lease)).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{project_id}/stems/{stem_name}",
+    params(("project_id" = Uuid, Path, description = "Project UUID"), ("stem_name" = String, Path, description = "One of drums, bass, other, vocals"), ("Range" = Option<String>, Header, description = "Optional single byte range")),
+    responses((status = 200, description = "Persistent full-length WAV stem", content_type = "audio/wav"), (status = 206, description = "Partial WAV response"), (status = 404, description = "Project stem not found"), (status = 416, description = "Invalid or unsatisfiable range"))
+)]
+pub async fn get_project_stem(
+    State(state): State<AppState>,
+    AxumPath((raw_project, stem_name)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, AppError> {
+    let project_id = Uuid::parse_str(&raw_project)
+        .map_err(|_| AppError::BadRequest("project_id must be a UUID".into()))?;
+    let stem_name = validate_stem_name(&stem_name)?;
+    let row = sqlx::query_as::<_, ProjectStem>("SELECT project_id,job_id,stem_name,storage_key,sample_rate,channels,frame_count,file_size_bytes,created_at FROM project_stems WHERE project_id=$1 AND stem_name=$2")
+        .bind(project_id).bind(stem_name).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
+    let path = resolve_project_stem(&state, &row).await?;
+    let range_header = headers
+        .get(header::RANGE)
+        .map(|value| value.to_str().unwrap_or(""));
+    let lease = storage::acquire_audio_stream(row.job_id).ok_or(AppError::NotFound)?;
+    stream_stem_with_lease(&path, range_header, Some(lease)).await
+}
+
+async fn resolve_project_stem(state: &AppState, stem: &ProjectStem) -> Result<PathBuf, AppError> {
+    let root = crate::services::project_storage::projects_root(&state.config.upload_dir);
+    let candidate = crate::services::project_storage::resolve_storage_key(&root, &stem.storage_key)
+        .map_err(AppError::Internal)?;
+    let canonical_root = fs::canonicalize(root).await.map_err(map_missing_file)?;
+    let canonical_path = fs::canonicalize(candidate)
+        .await
+        .map_err(map_missing_file)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(AppError::NotFound);
+    }
+    Ok(canonical_path)
+}
+
+fn project_stem_list(job_id: Uuid, status: &str, rows: Vec<ProjectStem>) -> StemListResponse {
+    StemListResponse {
+        job_id,
+        job_status: status.to_owned(),
+        stems: rows
+            .into_iter()
+            .map(|row| StemMetadata {
+                name: row.stem_name,
+                sample_rate: row.sample_rate as u32,
+                channels: row.channels as u16,
+                frame_count: row.frame_count as u64,
+                duration_seconds: row.frame_count as f64 / f64::from(row.sample_rate),
+                audio_format: "wav".into(),
+                file_size_bytes: Some(row.file_size_bytes as u64),
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]

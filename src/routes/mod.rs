@@ -1,6 +1,5 @@
 pub mod audio;
 pub mod beat_analysis;
-pub mod chunks;
 pub mod health;
 pub mod jobs;
 pub mod projects;
@@ -27,6 +26,7 @@ use crate::{services::job_manager::JobEvent, state::AppState};
         health::health,
         projects::create_project,
         projects::get_project,
+        projects::get_project_analysis,
         audio::upload_audio,
         audio::list_audio,
         jobs::create_job,
@@ -35,10 +35,10 @@ use crate::{services::job_manager::JobEvent, state::AppState};
         jobs::job_events,
         stems::list_stems,
         stems::get_stem,
-        chunks::list_chunks,
-        chunks::get_chunk_stem,
+        stems::get_project_stem,
         beat_analysis::create_beat_analysis,
-        beat_analysis::get_beat_analysis
+        beat_analysis::get_beat_analysis,
+        beat_analysis::get_job_analysis
     ),
     components(schemas(crate::models::beat_analysis::BeatAnalysisJob))
 )]
@@ -51,6 +51,14 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
         .route("/projects", post(projects::create_project))
         .route("/projects/{project_id}", get(projects::get_project))
         .route(
+            "/projects/{project_id}/analysis",
+            get(projects::get_project_analysis),
+        )
+        .route(
+            "/projects/{project_id}/stems/{stem_name}",
+            get(stems::get_project_stem),
+        )
+        .route(
             "/projects/{project_id}/audio",
             post(audio::upload_audio)
                 .get(audio::list_audio)
@@ -62,14 +70,13 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
         .route("/jobs/{job_id}/events", get(jobs::job_events))
         .route("/jobs/{job_id}/stems", get(stems::list_stems))
         .route("/jobs/{job_id}/stems/{stem_name}", get(stems::get_stem))
-        .route("/jobs/{job_id}/chunks", get(chunks::list_chunks))
-        .route(
-            "/jobs/{job_id}/chunks/{chunk_index}/stems/{stem_name}",
-            get(chunks::get_chunk_stem),
-        )
         .route(
             "/jobs/{job_id}/beat-analysis",
             post(beat_analysis::create_beat_analysis).get(beat_analysis::get_beat_analysis),
+        )
+        .route(
+            "/jobs/{job_id}/analysis",
+            get(beat_analysis::get_job_analysis),
         )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -99,13 +106,25 @@ mod tests {
             document
                 .paths
                 .paths
-                .contains_key("/api/v1/jobs/{job_id}/chunks")
+                .contains_key("/api/v1/jobs/{job_id}/analysis")
         );
         assert!(
             document
                 .paths
                 .paths
-                .contains_key("/api/v1/jobs/{job_id}/chunks/{chunk_index}/stems/{stem_name}")
+                .contains_key("/api/v1/projects/{project_id}/analysis")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/v1/projects/{project_id}/stems/{stem_name}")
+        );
+        assert!(
+            !document
+                .paths
+                .paths
+                .contains_key("/api/v1/jobs/{job_id}/chunks")
         );
     }
 }

@@ -52,6 +52,28 @@ pub async fn create_job(
             "audio asset does not belong to this project".into(),
         ));
     }
+    let has_completed_stems = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM project_stems WHERE project_id=$1)",
+    )
+    .bind(project_id)
+    .fetch_one(&state.db)
+    .await?;
+    if has_completed_stems {
+        return Err(AppError::Conflict(
+            "this project already has a completed stem set; replacing it requires an explicit replacement workflow".into(),
+        ));
+    }
+    let has_active_job = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM processing_jobs WHERE project_id=$1 AND status IN ('QUEUED','RUNNING'))",
+    )
+    .bind(project_id)
+    .fetch_one(&state.db)
+    .await?;
+    if has_active_job {
+        return Err(AppError::Conflict(
+            "this project already has an active separation job".into(),
+        ));
+    }
     let metadata = json!({
         "original_sample_rate": asset.1,
         "original_channels": asset.2,

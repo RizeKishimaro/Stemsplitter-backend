@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "soniclab-backend"
-version = "10.0.0"
+version = "10.2.2"
 dependencies = [
  "axum",
  "beat-this",
@@ -1970,6 +1970,7 @@ dependencies = [
  "http-body-util",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror",
  "tokio",

@@ -78,6 +78,7 @@ impl Drop for AudioCleanupLease {
 
 pub async fn prepare_root(root: &Path) -> Result<(), std::io::Error> {
     fs::create_dir_all(root).await?;
+    fs::create_dir_all(crate::services::project_storage::projects_root(root)).await?;
     cleanup_incomplete(root).await
 }
 
@@ -114,6 +115,10 @@ pub fn safe_extension(filename: &str) -> Option<&'static str> {
 pub fn upload_path(root: &Path, project_id: Uuid, asset_id: Uuid, extension: &str) -> PathBuf {
     root.join(project_id.to_string())
         .join(format!("{asset_id}.{extension}"))
+}
+
+pub async fn write_chunk(file: &mut tokio::fs::File, bytes: &[u8]) -> Result<(), std::io::Error> {
+    file.write_all(bytes).await
 }
 
 /// The inference worker stores outputs beside UPLOAD_DIR in `jobs/{job_id}`.
@@ -187,10 +192,6 @@ pub async fn cleanup_expired_audio(pool: &PgPool, upload_dir: &Path) -> Result<(
             .map_err(|error| format!("delete expired upload metadata: {error}"))?;
     }
     Ok(())
-}
-
-pub async fn write_chunk(file: &mut tokio::fs::File, bytes: &[u8]) -> Result<(), std::io::Error> {
-    file.write_all(bytes).await
 }
 
 pub fn validate_upload_size(size: u64, maximum: u64) -> Result<(), ()> {

@@ -1,6 +1,19 @@
+# Rust
 /target/
+
+# Environment
 /.env
 /.env.*
 !/.env.example
+
+# User uploads and generated audio
 /uploads/
 /data/uploads/
+/data/jobs/
+/data/projects/
+
+# Local model binaries
+/models/*.onnx
+
+# Logs
+*.log

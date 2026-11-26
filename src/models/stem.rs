@@ -1,4 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sqlx::FromRow;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -20,4 +22,17 @@ pub struct StemListResponse {
     /// Only successful jobs can return stems.
     pub job_status: String,
     pub stems: Vec<StemMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct ProjectStem {
+    pub project_id: Uuid,
+    pub job_id: Uuid,
+    pub stem_name: String,
+    pub storage_key: String,
+    pub sample_rate: i32,
+    pub channels: i16,
+    pub frame_count: i64,
+    pub file_size_bytes: i64,
+    pub created_at: DateTime<Utc>,
 }
