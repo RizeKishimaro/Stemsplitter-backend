@@ -123,6 +123,12 @@ mod tests {
                 .contains_key("/api/v1/projects/{project_id}/stems/{stem_name}")
         );
         assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/v1/jobs/{job_id}/stems/{stem_name}/partial")
+        );
+        assert!(
             !document
                 .paths
                 .paths
