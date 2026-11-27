@@ -46,6 +46,7 @@ use crate::{services::job_manager::JobEvent, state::AppState};
         stems::get_project_stem,
         beat_analysis::create_beat_analysis,
         beat_analysis::get_beat_analysis,
+        beat_analysis::list_beat_analyses,
         beat_analysis::get_job_analysis
     ),
     components(schemas(crate::models::beat_analysis::BeatAnalysisJob))
@@ -104,6 +105,10 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
         .route(
             "/jobs/{job_id}/beat-analysis",
             post(beat_analysis::create_beat_analysis).get(beat_analysis::get_beat_analysis),
+        )
+        .route(
+            "/jobs/{job_id}/beat-analyses",
+            get(beat_analysis::list_beat_analyses),
         )
         .route(
             "/jobs/{job_id}/analysis",
