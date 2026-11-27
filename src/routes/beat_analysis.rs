@@ -56,12 +56,8 @@ pub async fn create_beat_analysis(
     Query(query): Query<BeatAnalysisQuery>,
 ) -> Result<(StatusCode, Json<BeatAnalysisJob>), AppError> {
     let job_id = parse_uuid(&job_id)?;
-    let input_stem = query.input_stem.unwrap_or_else(|| "drums".into());
-    if !matches!(input_stem.as_str(), "drums" | "mix") {
-        return Err(AppError::BadRequest(
-            "input_stem must be either drums or mix".into(),
-        ));
-    }
+    let input_stem = parse_input_stem(query.input_stem)?;
+
     let job = sqlx::query_as::<_, ProcessingJob>("SELECT * FROM processing_jobs WHERE id = $1")
         .bind(job_id)
         .fetch_optional(&state.db)
@@ -263,6 +259,17 @@ pub async fn get_job_analysis(
     let result = sqlx::query_scalar::<_, Value>("SELECT result FROM beat_analyses WHERE separation_job_id=$1 AND status='SUCCEEDED' AND result IS NOT NULL ORDER BY finished_at DESC NULLS LAST, created_at DESC LIMIT 1")
         .bind(job_id).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
     Ok(Json(result))
+}
+
+fn parse_input_stem(value: Option<String>) -> Result<String, AppError> {
+    let input_stem = value.unwrap_or_else(|| "drums".into());
+    if matches!(input_stem.as_str(), "drums" | "mix") {
+        Ok(input_stem)
+    } else {
+        Err(AppError::BadRequest(
+            "input_stem must be either drums or mix".into(),
+        ))
+    }
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
@@ -653,10 +660,19 @@ fn count_beats_from_downbeats(beats: &[f64], downbeats: &[f64]) -> Vec<Option<u3
 #[cfg(test)]
 mod tests {
     use super::{
-        count_beats_from_downbeats, median_bpm, normalize_mono_frame, timestamp_to_sample,
-        validate_wav_metadata,
+        count_beats_from_downbeats, median_bpm, normalize_mono_frame, parse_input_stem,
+        timestamp_to_sample, validate_wav_metadata,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn beat_analysis_source_defaults_to_drums_and_accepts_original_mix() {
+        assert_eq!(parse_input_stem(None).unwrap(), "drums");
+        assert_eq!(parse_input_stem(Some("drums".into())).unwrap(), "drums");
+        assert_eq!(parse_input_stem(Some("mix".into())).unwrap(), "mix");
+        assert!(parse_input_stem(Some("vocals".into())).is_err());
+        assert!(parse_input_stem(Some("../outside".into())).is_err());
+    }
 
     #[test]
     fn detector_times_map_to_integer_samples_at_source_rate() {
