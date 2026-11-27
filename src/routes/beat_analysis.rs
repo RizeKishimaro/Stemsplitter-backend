@@ -7,7 +7,7 @@ use std::{
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use beat_this::{BeatStream, BeatThis, Model, RtenRuntime, Runtime};
@@ -25,6 +25,11 @@ use crate::{
 
 static BEAT_ANALYSIS_LIMIT: Semaphore = Semaphore::const_new(1);
 type BeatModel = <RtenRuntime as Runtime>::Model;
+#[derive(serde::Deserialize)]
+pub struct BeatAnalysisQuery {
+    input_stem: Option<String>,
+}
+
 struct CachedBeatDetector {
     mel_path: PathBuf,
     beat_path: PathBuf,
@@ -35,18 +40,24 @@ static BEAT_DETECTOR: OnceLock<Mutex<Option<CachedBeatDetector>>> = OnceLock::ne
 #[utoipa::path(
     post,
     path = "/api/v1/jobs/{job_id}/beat-analysis",
-    params(("job_id" = Uuid, Path, description = "Successful HTDemucs separation job UUID")),
+    params(
+        ("job_id" = Uuid, Path, description = "Successful HTDemucs separation job UUID"),
+        ("input_stem" = Option<String>, Query, description = "Analysis source: drums (default) or mix")
+    ),
     responses(
-        (status = 202, description = "Beat analysis queued against the drums stem", body = BeatAnalysisJob),
-        (status = 404, description = "Separation job or drums stem not found"),
+        (status = 202, description = "Beat analysis queued against the selected audio source", body = BeatAnalysisJob),
+        (status = 404, description = "Separation job or selected audio source not found"),
         (status = 409, description = "Separation job has not succeeded")
     )
 )]
 pub async fn create_beat_analysis(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
+    Query(query): Query<BeatAnalysisQuery>,
 ) -> Result<(StatusCode, Json<BeatAnalysisJob>), AppError> {
     let job_id = parse_uuid(&job_id)?;
+    let input_stem = parse_input_stem(query.input_stem)?;
+
     let job = sqlx::query_as::<_, ProcessingJob>("SELECT * FROM processing_jobs WHERE id = $1")
         .bind(job_id)
         .fetch_optional(&state.db)
@@ -58,13 +69,38 @@ pub async fn create_beat_analysis(
         ));
     }
 
-    let project_stem = sqlx::query_as::<_, (String, i32, i16, i64)>(
-        "SELECT storage_key,sample_rate,channels,frame_count FROM project_stems WHERE job_id=$1 AND stem_name='drums'",
-    )
-    .bind(job_id)
-    .fetch_optional(&state.db)
-    .await?;
-    let (path, sample_rate, channels, frame_count) =
+    let (path, sample_rate, channels, frame_count) = if input_stem == "mix" {
+        let (stored_path, rate, channel_count, frames) =
+            sqlx::query_as::<_, (String, i32, i16, i64)>(
+                "SELECT stored_path,sample_rate,channels,frame_count FROM audio_assets WHERE id=$1 AND project_id=$2",
+            )
+            .bind(job.audio_asset_id)
+            .bind(job.project_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
+        let path = tokio::fs::canonicalize(stored_path)
+            .await
+            .map_err(|_| AppError::NotFound)?;
+        let upload_root = tokio::fs::canonicalize(&state.config.upload_dir)
+            .await
+            .map_err(|_| AppError::NotFound)?;
+        let project_root =
+            crate::services::project_storage::projects_root(&state.config.upload_dir);
+        let project_root = tokio::fs::canonicalize(project_root)
+            .await
+            .map_err(|_| AppError::NotFound)?;
+        if !path.starts_with(upload_root) && !path.starts_with(project_root) {
+            return Err(AppError::NotFound);
+        }
+        (path, rate, channel_count, frames)
+    } else {
+        let project_stem = sqlx::query_as::<_, (String, i32, i16, i64)>(
+            "SELECT storage_key,sample_rate,channels,frame_count FROM project_stems WHERE job_id=$1 AND stem_name='drums'",
+        )
+        .bind(job_id)
+        .fetch_optional(&state.db)
+        .await?;
         if let Some((key, rate, channel_count, frames)) = project_stem {
             let root = crate::services::project_storage::projects_root(&state.config.upload_dir);
             let path = crate::services::project_storage::resolve_storage_key(&root, &key)
@@ -124,21 +160,26 @@ pub async fn create_beat_analysis(
                 .join(job_id.to_string())
                 .join("drums.wav");
             (path, sample_rate, channels, frame_count)
-        };
+        }
+    };
     if sample_rate <= 0 || channels <= 0 || frame_count <= 0 {
-        return Err(AppError::Internal(
-            "drums metadata contains non-positive audio dimensions".into(),
-        ));
+        return Err(AppError::Internal(format!(
+            "{input_stem} metadata contains non-positive audio dimensions"
+        )));
     }
     tokio::fs::metadata(&path)
         .await
         .map_err(|_| AppError::NotFound)?;
-    let audio_lease = storage::acquire_audio_stream(job_id).ok_or(AppError::NotFound)?;
+    // Project cleanup is coordinated by project ID, not the separation job ID.
+    // Hold this lease for the entire asynchronous analysis so expired-project
+    // cleanup cannot remove the selected audio file while Beat This is reading it.
+    let audio_lease = storage::acquire_audio_stream(job.project_id).ok_or(AppError::NotFound)?;
 
     let analysis = sqlx::query_as::<_, BeatAnalysisJob>(
-        "INSERT INTO beat_analyses (separation_job_id, sample_rate, channels, frame_count, model_version) VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        "INSERT INTO beat_analyses (separation_job_id, input_stem, sample_rate, channels, frame_count, model_version) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
     )
     .bind(job_id)
+    .bind(&input_stem)
     .bind(sample_rate)
     .bind(channels)
     .bind(frame_count)
@@ -169,6 +210,7 @@ pub async fn create_beat_analysis(
             channels,
             frame_count as u64,
             project_id,
+            input_stem,
             beats_per_bar,
             mel_model,
             beat_model,
@@ -206,6 +248,29 @@ pub async fn get_beat_analysis(
 
 #[utoipa::path(
     get,
+    path = "/api/v1/jobs/{job_id}/beat-analyses",
+    params(("job_id" = Uuid, Path, description = "Separation job UUID")),
+    responses(
+        (status = 200, description = "All beat-analysis attempts, newest first", body = [BeatAnalysisJob]),
+        (status = 400, description = "Invalid job UUID")
+    )
+)]
+pub async fn list_beat_analyses(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<Vec<BeatAnalysisJob>>, AppError> {
+    let job_id = parse_uuid(&job_id)?;
+    let analyses = sqlx::query_as::<_, BeatAnalysisJob>(
+        "SELECT * FROM beat_analyses WHERE separation_job_id = $1 ORDER BY created_at DESC, id DESC",
+    )
+    .bind(job_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(analyses))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/jobs/{job_id}/analysis",
     params(("job_id" = Uuid, Path, description = "Separation job UUID")),
     responses((status = 200, description = "Saved, versioned complete beat grid"), (status = 404, description = "Saved analysis not found"))
@@ -218,6 +283,17 @@ pub async fn get_job_analysis(
     let result = sqlx::query_scalar::<_, Value>("SELECT result FROM beat_analyses WHERE separation_job_id=$1 AND status='SUCCEEDED' AND result IS NOT NULL ORDER BY finished_at DESC NULLS LAST, created_at DESC LIMIT 1")
         .bind(job_id).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
     Ok(Json(result))
+}
+
+fn parse_input_stem(value: Option<String>) -> Result<String, AppError> {
+    let input_stem = value.unwrap_or_else(|| "drums".into());
+    if matches!(input_stem.as_str(), "drums" | "mix") {
+        Ok(input_stem)
+    } else {
+        Err(AppError::BadRequest(
+            "input_stem must be either drums or mix".into(),
+        ))
+    }
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
@@ -233,6 +309,7 @@ async fn execute_analysis(
     channels: u16,
     frame_count: u64,
     project_id: Uuid,
+    input_stem: String,
     beats_per_bar: u8,
     mel_model: PathBuf,
     beat_model: PathBuf,
@@ -240,8 +317,23 @@ async fn execute_analysis(
     audio_lease: storage::AudioFileLease,
 ) {
     let _audio_lease = audio_lease;
-    let Ok(_permit) = BEAT_ANALYSIS_LIMIT.acquire().await else {
-        return;
+    let _permit = match BEAT_ANALYSIS_LIMIT.acquire().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            let message = format!("beat analysis worker is unavailable: {error}");
+            tracing::error!(%analysis_id, %message, "could not acquire beat analysis slot");
+            if let Err(update_error) = sqlx::query(
+                "UPDATE beat_analyses SET status='FAILED', error_message=$2, finished_at=now(), updated_at=now() WHERE id=$1",
+            )
+            .bind(analysis_id)
+            .bind(&message)
+            .execute(&db)
+            .await
+            {
+                tracing::error!(%analysis_id, %update_error, "could not persist beat analysis failure");
+            }
+            return;
+        }
     };
     let _ = sqlx::query(
         "UPDATE beat_analyses SET status = 'RUNNING', updated_at = now() WHERE id = $1",
@@ -251,13 +343,14 @@ async fn execute_analysis(
     .await;
 
     let inference_started = Instant::now();
+    let analysis_input_stem = input_stem.clone();
     let work = tokio::task::spawn_blocking(move || {
         analyze_wav(
             &audio_path,
             sample_rate,
             channels,
             frame_count,
-            "drums",
+            &analysis_input_stem,
             &mel_model,
             &beat_model,
             model_version,
@@ -267,7 +360,7 @@ async fn execute_analysis(
 
     match work {
         Ok(Ok((result, decode_and_inference_ms))) => {
-            tracing::info!(%analysis_id, analysis_ms = decode_and_inference_ms, total_ms = inference_started.elapsed().as_millis(), stage_ms = %result["analysis_metadata"]["stages_ms"], "drum beat analysis complete");
+            tracing::info!(%analysis_id, input_stem = %input_stem, analysis_ms = decode_and_inference_ms, total_ms = inference_started.elapsed().as_millis(), stage_ms = %result["analysis_metadata"]["stages_ms"], "beat analysis complete");
             match crate::services::job_manager::build_beat_grid(
                 job_id,
                 project_id,
@@ -288,7 +381,7 @@ async fn execute_analysis(
             }
         }
         Ok(Err(message)) => {
-            tracing::warn!(%analysis_id, %message, "drum beat analysis failed");
+            tracing::warn!(%analysis_id, %message, "beat analysis failed");
             let _ = sqlx::query("UPDATE beat_analyses SET status = 'FAILED', error_message = $2, finished_at = now(), updated_at = now() WHERE id = $1")
                 .bind(analysis_id).bind(message).execute(&db).await;
         }
@@ -592,10 +685,19 @@ fn count_beats_from_downbeats(beats: &[f64], downbeats: &[f64]) -> Vec<Option<u3
 #[cfg(test)]
 mod tests {
     use super::{
-        count_beats_from_downbeats, median_bpm, normalize_mono_frame, timestamp_to_sample,
-        validate_wav_metadata,
+        count_beats_from_downbeats, median_bpm, normalize_mono_frame, parse_input_stem,
+        timestamp_to_sample, validate_wav_metadata,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn beat_analysis_source_defaults_to_drums_and_accepts_original_mix() {
+        assert_eq!(parse_input_stem(None).unwrap(), "drums");
+        assert_eq!(parse_input_stem(Some("drums".into())).unwrap(), "drums");
+        assert_eq!(parse_input_stem(Some("mix".into())).unwrap(), "mix");
+        assert!(parse_input_stem(Some("vocals".into())).is_err());
+        assert!(parse_input_stem(Some("../outside".into())).is_err());
+    }
 
     #[test]
     fn detector_times_map_to_integer_samples_at_source_rate() {
