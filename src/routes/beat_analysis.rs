@@ -85,7 +85,8 @@ pub async fn create_beat_analysis(
         let upload_root = tokio::fs::canonicalize(&state.config.upload_dir)
             .await
             .map_err(|_| AppError::NotFound)?;
-        let project_root = crate::services::project_storage::projects_root(&state.config.upload_dir);
+        let project_root =
+            crate::services::project_storage::projects_root(&state.config.upload_dir);
         let project_root = tokio::fs::canonicalize(project_root)
             .await
             .map_err(|_| AppError::NotFound)?;
@@ -162,9 +163,9 @@ pub async fn create_beat_analysis(
         }
     };
     if sample_rate <= 0 || channels <= 0 || frame_count <= 0 {
-        return Err(AppError::Internal(
-            format!("{input_stem} metadata contains non-positive audio dimensions"),
-        ));
+        return Err(AppError::Internal(format!(
+            "{input_stem} metadata contains non-positive audio dimensions"
+        )));
     }
     tokio::fs::metadata(&path)
         .await
