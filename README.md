@@ -313,17 +313,25 @@ Supported analysis strategies:
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/api/v1/jobs/:job_id/beat-analysis` | Queue Beat This! analysis |
-| GET | `/api/v1/jobs/:job_id/beat-analysis` | Retrieve analysis status and result |
+| POST | `/api/v1/jobs/:job_id/beat-analysis` | Queue Beat This! analysis against the drums stem or original mix |
+| GET | `/api/v1/jobs/:job_id/beat-analysis` | Retrieve the latest analysis status and result |
 | GET | `/api/v1/jobs/:job_id/analysis` | Retrieve complete saved beat-grid JSON |
 
 Beat analysis is a separate job from HTDemucs separation.
 
-It does not enter or modify the Demucs queue.
+It does not enter or modify the Demucs queue. After separation succeeds, callers can choose the analysis source:
+
+```http
+POST /api/v1/jobs/:job_id/beat-analysis
+POST /api/v1/jobs/:job_id/beat-analysis?input_stem=drums
+POST /api/v1/jobs/:job_id/beat-analysis?input_stem=mix
+```
+
+The default source is `drums`. Use `input_stem=mix` to re-analyze the preserved original audio. This makes it possible to compare the original-mix and drums-stem detector outputs without rerunning HTDemucs. Each request creates a separate analysis record; the GET endpoint returns the most recently created record.
 
 The detector instance is cached and reused. WAV decoding and CPU inference run in a blocking worker thread.
 
-The service records model loading, WAV validation, decoding, mel processing, beat inference, peak decoding, and total execution timings.
+The service records model loading, WAV validation, decoding, mel processing, beat inference, peak decoding, and total execution timings. Analysis holds a project audio lease while reading the source so expired-project cleanup cannot remove it mid-inference. In-flight process-local analyses are marked failed during API startup recovery rather than remaining stuck in `RUNNING` after a restart.
 
 ---
 
