@@ -42,6 +42,7 @@ use crate::{services::job_manager::JobEvent, state::AppState};
         jobs::job_events,
         stems::list_stems,
         stems::get_stem,
+        stems::get_partial_stem,
         stems::get_project_stem,
         beat_analysis::create_beat_analysis,
         beat_analysis::get_beat_analysis,
@@ -96,6 +97,7 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
         .route("/jobs/{job_id}/events", get(jobs::job_events))
         .route("/jobs/{job_id}/stems", get(stems::list_stems))
         .route("/jobs/{job_id}/stems/{stem_name}", get(stems::get_stem))
+        .route("/jobs/{job_id}/stems/{stem_name}/partial", get(stems::get_partial_stem))
         .route(
             "/jobs/{job_id}/beat-analysis",
             post(beat_analysis::create_beat_analysis).get(beat_analysis::get_beat_analysis),
@@ -145,6 +147,12 @@ mod tests {
                 .paths
                 .paths
                 .contains_key("/api/v1/projects/{project_id}/stems/{stem_name}")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/v1/jobs/{job_id}/stems/{stem_name}/partial")
         );
         assert!(
             !document

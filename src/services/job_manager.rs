@@ -476,7 +476,66 @@ impl JobManager {
                             self.progress(job.id,message.progress.unwrap_or(0.0)).await;
                         }
                         "stem.completed" if message.job_id == Some(job.id) => {
-                            tracing::info!(job_id = %job.id, stem = message.stem.as_deref().unwrap_or("unknown"), "worker finished a staging stem; project asset is not published until final transaction commits");
+                            let stem = message.stem.as_deref().unwrap_or("");
+                            if !["drums", "bass", "other", "vocals"].contains(&stem) {
+                                tracing::warn!(job_id = %job.id, stem, "ignored worker stem with unsupported name");
+                                continue;
+                            }
+                            let Some(metadata) = message.stem_metadata.as_ref() else {
+                                tracing::warn!(job_id = %job.id, stem, "ignored completed stem without metadata");
+                                continue;
+                            };
+                            let sample_rate = metadata.get("sample_rate").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok());
+                            let channels = metadata.get("channels").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok());
+                            let frame_count = metadata.get("frame_count").and_then(Value::as_u64);
+                            let (Some(sample_rate), Some(channels), Some(frame_count)) = (sample_rate, channels, frame_count) else {
+                                tracing::warn!(job_id = %job.id, stem, "ignored completed stem with invalid audio metadata");
+                                continue;
+                            };
+                            if !(8_000..=384_000).contains(&sample_rate) || !(1..=2).contains(&channels) || frame_count == 0 {
+                                tracing::warn!(job_id = %job.id, stem, "ignored completed stem with out-of-range audio metadata");
+                                continue;
+                            }
+                            let source = stage.join(format!("{stem}.wav"));
+                            let file_size = match crate::services::project_storage::validate_stem_wav(&source, sample_rate, channels, frame_count) {
+                                Ok(size) => size,
+                                Err(error) => {
+                                    tracing::warn!(job_id = %job.id, stem, %error, "worker stem failed WAV validation");
+                                    continue;
+                                }
+                            };
+                            let partial_root = crate::services::storage::jobs_root(&self.config.upload_dir)
+                                .join(job.id.to_string())
+                                .join("partial");
+                            let destination = partial_root.join(format!("{stem}.wav"));
+                            if let Err(error) = crate::services::project_storage::atomic_copy_new(&source, &destination).await {
+                                tracing::warn!(job_id = %job.id, stem, %error, "could not publish completed partial stem");
+                                continue;
+                            }
+                            let duration_seconds = frame_count as f64 / f64::from(sample_rate);
+                            let stem_metadata = json!({
+                                "name": stem,
+                                "sample_rate": sample_rate,
+                                "channels": channels,
+                                "frame_count": frame_count,
+                                "duration_seconds": duration_seconds,
+                                "audio_format": "wav",
+                                "file_size_bytes": file_size,
+                                "url": format!("/api/v1/jobs/{}/stems/{}/partial", job.id, stem)
+                            });
+                            let _ = self.events.send(JobEvent {
+                                event: "stem.completed".into(),
+                                stage: Some("STEM_SEPARATION".into()),
+                                stem: Some(stem.to_owned()),
+                                stem_metadata: Some(stem_metadata),
+                                chunk: None,
+                                analysis: None,
+                                job_id: job.id,
+                                status: "RUNNING".into(),
+                                progress: worker_progress(1.0),
+                                message: Some(format!("{stem} stem is ready to download")),
+                            });
+                            tracing::info!(job_id = %job.id, stem, file_size, "validated partial stem published for incremental download");
                         }
                         "cancelled" if message.job_id == Some(job.id) && message.acknowledged == Some(true) =>{
                             self.cancel_acknowledged(job.id).await;
