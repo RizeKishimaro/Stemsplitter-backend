@@ -5,7 +5,6 @@ mod routes;
 mod services;
 mod state;
 
-use core::fmt;
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -52,6 +51,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&config.database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+
+    // Beat-analysis tasks are currently process-local. Mark any in-flight
+    // analysis as failed after a restart instead of leaving it RUNNING forever.
+    // The owning separation job has its own recovery/requeue path below.
+    let interrupted_beat_analyses = sqlx::query(
+        "UPDATE beat_analyses SET status='FAILED', error_message='analysis interrupted by server restart', finished_at=COALESCE(finished_at, now()), updated_at=now() WHERE status='RUNNING'",
+    )
+    .execute(&pool)
+    .await?
+    .rows_affected();
+    if interrupted_beat_analyses > 0 {
+        tracing::warn!(
+            count = interrupted_beat_analyses,
+            "marked interrupted beat analyses as failed during startup recovery"
+        );
+    }
 
     let events = event_channel();
     let manager = Arc::new(JobManager::new(
