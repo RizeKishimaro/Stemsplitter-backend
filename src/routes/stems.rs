@@ -54,15 +54,6 @@ pub async fn list_stems(
     {
         return Err(AppError::Gone);
     }
-    if !crate::services::project_activity::touch_project(
-        &state.db,
-        job.project_id,
-        state.config.project_ttl,
-    )
-    .await?
-    {
-        return Err(AppError::Gone);
-    }
     let rows = sqlx::query_as::<_, ProjectStem>("SELECT project_id,job_id,stem_name,storage_key,sample_rate,channels,frame_count,file_size_bytes,created_at FROM project_stems WHERE job_id=$1 ORDER BY stem_name")
         .bind(job_id).fetch_all(&state.db).await?;
     let response = if rows.is_empty() {
