@@ -148,6 +148,12 @@ mod tests {
             document
                 .paths
                 .paths
+                .contains_key("/api/v1/jobs/{job_id}/beat-analyses")
+        );
+        assert!(
+            document
+                .paths
+                .paths
                 .contains_key("/api/v1/projects/{project_id}/analysis")
         );
         assert!(
