@@ -315,6 +315,7 @@ Supported analysis strategies:
 |---|---|---|
 | POST | `/api/v1/jobs/:job_id/beat-analysis` | Queue Beat This! analysis against the drums stem or original mix |
 | GET | `/api/v1/jobs/:job_id/beat-analysis` | Retrieve the latest analysis status and result |
+| GET | `/api/v1/jobs/:job_id/beat-analyses` | Retrieve analysis history for comparing mix and drums results |
 | GET | `/api/v1/jobs/:job_id/analysis` | Retrieve complete saved beat-grid JSON |
 
 Beat analysis is a separate job from HTDemucs separation.
@@ -327,7 +328,7 @@ POST /api/v1/jobs/:job_id/beat-analysis?input_stem=drums
 POST /api/v1/jobs/:job_id/beat-analysis?input_stem=mix
 ```
 
-The default source is `drums`. Use `input_stem=mix` to re-analyze the preserved original audio. This makes it possible to compare the original-mix and drums-stem detector outputs without rerunning HTDemucs. Each request creates a separate analysis record; the GET endpoint returns the most recently created record.
+The default source is `drums`. Use `input_stem=mix` to re-analyze the preserved original audio. This makes it possible to compare the original-mix and drums-stem detector outputs without rerunning HTDemucs. Each request creates a separate analysis record. The singular GET endpoint returns the most recently created record; the plural `/beat-analyses` endpoint returns the full history so the frontend can compare mix and drums results.
 
 The detector instance is cached and reused. WAV decoding and CPU inference run in a blocking worker thread.
 
