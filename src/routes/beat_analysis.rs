@@ -133,7 +133,10 @@ pub async fn create_beat_analysis(
     tokio::fs::metadata(&path)
         .await
         .map_err(|_| AppError::NotFound)?;
-    let audio_lease = storage::acquire_audio_stream(job_id).ok_or(AppError::NotFound)?;
+    // Project cleanup is coordinated by project ID, not the separation job ID.
+    // Hold this lease for the entire asynchronous analysis so expired-project
+    // cleanup cannot remove the drums file while Beat This is reading it.
+    let audio_lease = storage::acquire_audio_stream(job.project_id).ok_or(AppError::NotFound)?;
 
     let analysis = sqlx::query_as::<_, BeatAnalysisJob>(
         "INSERT INTO beat_analyses (separation_job_id, sample_rate, channels, frame_count, model_version) VALUES ($1, $2, $3, $4, $5) RETURNING *",
@@ -240,8 +243,23 @@ async fn execute_analysis(
     audio_lease: storage::AudioFileLease,
 ) {
     let _audio_lease = audio_lease;
-    let Ok(_permit) = BEAT_ANALYSIS_LIMIT.acquire().await else {
-        return;
+    let _permit = match BEAT_ANALYSIS_LIMIT.acquire().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            let message = format!("beat analysis worker is unavailable: {error}");
+            tracing::error!(%analysis_id, %message, "could not acquire beat analysis slot");
+            if let Err(update_error) = sqlx::query(
+                "UPDATE beat_analyses SET status='FAILED', error_message=$2, finished_at=now(), updated_at=now() WHERE id=$1",
+            )
+            .bind(analysis_id)
+            .bind(&message)
+            .execute(&db)
+            .await
+            {
+                tracing::error!(%analysis_id, %update_error, "could not persist beat analysis failure");
+            }
+            return;
+        }
     };
     let _ = sqlx::query(
         "UPDATE beat_analyses SET status = 'RUNNING', updated_at = now() WHERE id = $1",
