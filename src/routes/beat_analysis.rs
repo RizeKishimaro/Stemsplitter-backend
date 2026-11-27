@@ -248,6 +248,29 @@ pub async fn get_beat_analysis(
 
 #[utoipa::path(
     get,
+    path = "/api/v1/jobs/{job_id}/beat-analyses",
+    params(("job_id" = Uuid, Path, description = "Separation job UUID")),
+    responses(
+        (status = 200, description = "All beat-analysis attempts, newest first", body = [BeatAnalysisJob]),
+        (status = 400, description = "Invalid job UUID")
+    )
+)]
+pub async fn list_beat_analyses(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<Vec<BeatAnalysisJob>>, AppError> {
+    let job_id = parse_uuid(&job_id)?;
+    let analyses = sqlx::query_as::<_, BeatAnalysisJob>(
+        "SELECT * FROM beat_analyses WHERE separation_job_id = $1 ORDER BY created_at DESC, id DESC",
+    )
+    .bind(job_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(analyses))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/jobs/{job_id}/analysis",
     params(("job_id" = Uuid, Path, description = "Separation job UUID")),
     responses((status = 200, description = "Saved, versioned complete beat grid"), (status = 404, description = "Saved analysis not found"))
