@@ -102,6 +102,54 @@ pub async fn get_stem(
 
 #[utoipa::path(
     get,
+    path = "/api/v1/jobs/{job_id}/stems/{stem_name}/partial",
+    params(
+        ("job_id" = Uuid, Path, description = "Running or completed separation job UUID"),
+        ("stem_name" = String, Path, description = "One of drums, bass, other, vocals"),
+        ("Range" = Option<String>, Header, description = "Optional single byte range")
+    ),
+    responses(
+        (status = 200, description = "Incrementally available WAV stem", content_type = "audio/wav"),
+        (status = 206, description = "Partial WAV response"),
+        (status = 404, description = "Job or partial stem not found"),
+        (status = 409, description = "Job is not running or succeeded")
+    )
+)]
+pub async fn get_partial_stem(
+    State(state): State<AppState>,
+    AxumPath((raw_job, stem_name)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, AppError> {
+    let job_id = parse_job_id(&raw_job)?;
+    let stem_name = validate_stem_name(&stem_name)?;
+    let job = get_job(&state, job_id).await?;
+    if !matches!(job.status.as_str(), "RUNNING" | "SUCCEEDED") {
+        return Err(AppError::Conflict("partial stems are only available while a job is running or after it succeeds".into()));
+    }
+
+    let root = storage::jobs_root(&state.config.upload_dir);
+    let canonical_root = fs::canonicalize(&root).await.map_err(map_missing_file)?;
+    let partial_dir = fs::canonicalize(canonical_root.join(job_id.to_string()).join("partial"))
+        .await
+        .map_err(map_missing_file)?;
+    if !partial_dir.starts_with(&canonical_root) {
+        return Err(AppError::NotFound);
+    }
+    let path = fs::canonicalize(partial_dir.join(format!("{stem_name}.wav")))
+        .await
+        .map_err(map_missing_file)?;
+    if !path.starts_with(&partial_dir) {
+        return Err(AppError::NotFound);
+    }
+    let range_header = headers
+        .get(header::RANGE)
+        .map(|value| value.to_str().unwrap_or(""));
+    let lease = storage::acquire_audio_stream(job_id).ok_or(AppError::NotFound)?;
+    stream_stem_with_lease(&path, range_header, Some(lease)).await
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/projects/{project_id}/stems/{stem_name}",
     params(("project_id" = Uuid, Path, description = "Project UUID"), ("stem_name" = String, Path, description = "One of drums, bass, other, vocals"), ("Range" = Option<String>, Header, description = "Optional single byte range")),
     responses((status = 200, description = "Persistent full-length WAV stem", content_type = "audio/wav"), (status = 206, description = "Partial WAV response"), (status = 404, description = "Project stem not found"), (status = 416, description = "Invalid or unsatisfiable range"))
