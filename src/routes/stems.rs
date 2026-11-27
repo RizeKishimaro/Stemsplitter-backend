@@ -142,7 +142,9 @@ pub async fn get_partial_stem(
     let stem_name = validate_stem_name(&stem_name)?;
     let job = get_job(&state, job_id).await?;
     if !matches!(job.status.as_str(), "RUNNING" | "SUCCEEDED") {
-        return Err(AppError::Conflict("partial stems are only available while a job is running or after it succeeds".into()));
+        return Err(AppError::Conflict(
+            "partial stems are only available while a job is running or after it succeeds".into(),
+        ));
     }
 
     let root = storage::jobs_root(&state.config.upload_dir);
