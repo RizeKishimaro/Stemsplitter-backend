@@ -81,38 +81,45 @@ def cached_model_files():
 
 
 def load_separator():
-    """Load HTDemucs using the configured device and cached checkpoints."""
+    """Select and validate an available runtime by running real model inference."""
     import torch
     from demucs.api import Separator
+    import platform
+    import time
 
     requested = os.environ.get("DEMUCS_DEVICE", "auto").lower()
-
-    allow_cpu = os.environ.get(
-        "DEMUCS_ALLOW_CPU_FALLBACK",
-        "false",
-    ).lower() in ("1", "true", "yes")
-
     cuda_available = bool(torch.cuda.is_available())
+    is_rocm = bool(getattr(torch.version, "hip", None))
+    mps_backend = getattr(getattr(torch.backends, "mps", None), "is_available", None)
+    mps_available = bool(mps_backend and mps_backend())
+    machine = platform.machine().lower()
+    system = platform.system()
 
-    if requested not in ("auto", "cuda", "cpu"):
-        raise RuntimeError("DEMUCS_DEVICE must be auto, cuda, or cpu")
+    if requested not in ("auto", "cuda", "mps", "rocm", "cpu"):
+        raise RuntimeError("DEMUCS_DEVICE must be auto, cuda, mps, rocm, or cpu")
 
-    if requested == "cuda" and not cuda_available:
-        raise RuntimeError(
-            "CUDA was explicitly requested, but PyTorch cannot access a CUDA device"
-        )
-
-    if requested == "auto" and not cuda_available and not allow_cpu:
-        raise RuntimeError(
-            "CUDA is unavailable and CPU fallback is disabled; "
-            "set DEMUCS_DEVICE=cpu explicitly to opt in"
-        )
-
-    device = (
-        "cuda"
-        if requested == "cuda" or (requested == "auto" and cuda_available)
-        else "cpu"
-    )
+    devices = []
+    if requested == "auto":
+        if cuda_available and is_rocm:
+            devices.append(("rocm", "cuda"))
+        elif cuda_available:
+            devices.append(("cuda", "cuda"))
+        if system == "Darwin" and machine in ("arm64", "aarch64") and mps_available:
+            devices.append(("mps", "mps"))
+        devices.append(("cpu", "cpu"))
+    elif requested == "cuda":
+        if cuda_available and not is_rocm:
+            devices.append(("cuda", "cuda"))
+    elif requested == "rocm":
+        if cuda_available and is_rocm:
+            devices.append(("rocm", "cuda"))
+    elif requested == "mps":
+        if system == "Darwin" and machine in ("arm64", "aarch64") and mps_available:
+            devices.append(("mps", "mps"))
+    else:
+        devices.append(("cpu", "cpu"))
+    if not devices:
+        raise RuntimeError(f"requested Demucs backend '{requested}' is not available in this PyTorch runtime")
 
     cache_config, signatures = cached_model_files()
 
@@ -122,28 +129,76 @@ def load_separator():
 
     torch.hub.load_state_dict_from_url = no_remote_download
 
-    separator = Separator(
-        model="htdemucs",
-        device=device,
-        shifts=1,
-        split=True,
-        overlap=0.25,
-        progress=False,
-    )
-
-    gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else None
-
-    return separator, {
-        "device": device,
-        "cuda_available": cuda_available,
-        "gpu_name": gpu_name,
-        "sample_rate": separator.samplerate,
-        "channels": separator.audio_channels,
-        "sources": separator.model.sources,
-        "model": "htdemucs",
-        "cache_config": cache_config,
-        "checkpoint_signatures": signatures,
-    }
+    failures = []
+    for backend, device in devices:
+        separator = None
+        try:
+            load_started = time.perf_counter()
+            separator = Separator(
+                model="htdemucs",
+                device=device,
+                shifts=1,
+                split=True,
+                overlap=0.25,
+                progress=False,
+            )
+            model_init_ms = round((time.perf_counter() - load_started) * 1000, 2)
+            probe = torch.zeros((separator.audio_channels, separator.samplerate), dtype=torch.float32)
+            inference_started = time.perf_counter()
+            _, output = separator.separate_tensor(probe, sr=separator.samplerate)
+            inference_test_ms = round((time.perf_counter() - inference_started) * 1000, 2)
+            expected = set(separator.model.sources)
+            if set(output) != expected or not all(
+                tuple(value.shape) == tuple(probe.shape) and bool(torch.isfinite(value).all())
+                for value in output.values()
+            ):
+                raise RuntimeError("HTDemucs hardware validation produced invalid stem output")
+            gpu_name = None
+            memory_bytes = None
+            if device == "cuda":
+                gpu_name = torch.cuda.get_device_name(0)
+                try:
+                    memory_bytes = int(torch.cuda.mem_get_info(0)[0])
+                except Exception:
+                    pass
+            elif device == "mps":
+                gpu_name = "Apple Silicon MPS"
+                try:
+                    memory_bytes = int(torch.mps.driver_allocated_memory())
+                except Exception:
+                    pass
+            return separator, {
+                "device": device,
+                "backend": backend,
+                "device_available": True,
+                "cuda_available": cuda_available,
+                "mps_available": mps_available,
+                "rocm_available": is_rocm and cuda_available,
+                "device_name": gpu_name or "CPU",
+                "device_memory_bytes": memory_bytes,
+                "platform": system,
+                "architecture": machine,
+                "model": "htdemucs",
+                "model_initialization_ms": model_init_ms,
+                "inference_test_ms": inference_test_ms,
+                "inference_test_passed": True,
+                "fallback_reason": "; ".join(failures) or None,
+                "sample_rate": separator.samplerate,
+                "channels": separator.audio_channels,
+                "sources": separator.model.sources,
+                "cache_config": cache_config,
+                "checkpoint_signatures": signatures,
+            }
+        except Exception as error:
+            failures.append(f"{backend} initialization/inference failed: {error}")
+            del separator
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+            if requested != "auto":
+                raise RuntimeError(failures[-1]) from error
+    raise RuntimeError("all Demucs backends failed validation: " + "; ".join(failures))
 
 
 def resample_exact(wave, source_rate, target_rate, frames):
@@ -204,15 +259,9 @@ def validate_metadata(path, expected):
             "between 8000 and 384000 Hz is supported"
         )
 
-    # The browser's sample rate describes its decoded AudioBuffer, which may
-    # differ from the encoded source rate. Keep channel layout validation
-    # strict, but use the decoded file header as the source-rate authority.
-    expected_channels = int(expected["channels"])
-    if expected_channels != actual["channels"]:
-        raise ValueError(
-            f"Audio metadata mismatch for channels: "
-            f"expected {expected_channels}, decoded {actual['channels']}"
-        )
+    # Browser metadata is advisory: browser decoders can report a different
+    # decoded sample rate and may not expose the encoded channel/frame values.
+    # The source container and the exact waveform decoded below are authoritative.
 
     return actual
 

@@ -26,6 +26,7 @@ pub struct Config {
     pub beat_this_model_version: Option<String>,
     pub beat_this_threads: usize,
     pub audio_job_ttl: Duration,
+    pub project_ttl: Duration,
 }
 
 impl Config {
@@ -68,6 +69,10 @@ impl Config {
         if audio_job_ttl_secs == 0 {
             return Err("AUDIO_JOB_TTL_SECS must be positive".into());
         }
+        let project_ttl_secs = value("PROJECT_TTL_SECS", 36_000_u64)?;
+        if project_ttl_secs == 0 {
+            return Err("PROJECT_TTL_SECS must be positive".into());
+        }
         let cors_allow_origins = env::var("CORS_ALLOW_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:5173".into())
             .split(',')
@@ -100,8 +105,9 @@ impl Config {
             address,
             database_url,
             database_max_connections: value("DATABASE_MAX_CONNECTIONS", 10_u32)?,
-            upload_dir: PathBuf::from(
-                env::var("UPLOAD_DIR").unwrap_or_else(|_| "./data/uploads".into()),
+            upload_dir: resolve_app_path(
+                PathBuf::from(env::var("UPLOAD_DIR").unwrap_or_else(|_| "data/uploads".into())),
+                &application_root,
             ),
             max_upload_bytes,
             job_concurrency,
@@ -124,6 +130,7 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             beat_this_threads,
             audio_job_ttl: Duration::from_secs(audio_job_ttl_secs),
+            project_ttl: Duration::from_secs(project_ttl_secs),
         })
     }
 }

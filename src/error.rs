@@ -5,6 +5,8 @@ use serde::Serialize;
 pub enum AppError {
     #[error("not found")]
     NotFound,
+    #[error("resource expired")]
+    Gone,
     #[error("invalid request: {0}")]
     BadRequest(String),
     #[error("conflict: {0}")]
@@ -37,6 +39,11 @@ impl IntoResponse for AppError {
                 StatusCode::NOT_FOUND,
                 "not_found",
                 "Resource not found".into(),
+            ),
+            Self::Gone => (
+                StatusCode::GONE,
+                "expired",
+                "This DubPad project has expired".into(),
             ),
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
             Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message),

@@ -43,6 +43,15 @@ struct WorkerMessage {
     device: Option<String>,
     cuda_available: Option<bool>,
     gpu_name: Option<String>,
+    backend: Option<String>,
+    device_name: Option<String>,
+    device_memory_bytes: Option<u64>,
+    platform: Option<String>,
+    architecture: Option<String>,
+    model_initialization_ms: Option<f64>,
+    inference_test_ms: Option<f64>,
+    inference_test_passed: Option<bool>,
+    fallback_reason: Option<String>,
     stem: Option<String>,
     stem_metadata: Option<Value>,
 }
@@ -52,6 +61,7 @@ struct WorkerProcess {
     stdin: ChildStdin,
     messages: mpsc::UnboundedReceiver<String>,
     _reader: JoinHandle<()>,
+    hardware_info: Value,
 }
 
 impl WorkerProcess {
@@ -89,6 +99,7 @@ impl WorkerProcess {
             stdin,
             messages,
             _reader: reader,
+            hardware_info: Value::Null,
         };
         let startup = time::timeout(config.demucs_startup_timeout, worker.messages.recv())
             .await
@@ -112,6 +123,22 @@ impl WorkerProcess {
             gpu = message.gpu_name.as_deref().unwrap_or("none"),
             "HTDemucs worker ready"
         );
+        let hardware_info = json!({
+            "status": "ready",
+            "device": message.device,
+            "backend": message.backend,
+            "available": true,
+            "deviceName": message.device_name.or(message.gpu_name),
+            "deviceMemoryBytes": message.device_memory_bytes,
+            "platform": message.platform,
+            "architecture": message.architecture,
+            "model": "htdemucs",
+            "modelInitializationMs": message.model_initialization_ms,
+            "inferenceTestMs": message.inference_test_ms,
+            "inferenceTestPassed": message.inference_test_passed.unwrap_or(false),
+            "fallbackReason": message.fallback_reason
+        });
+        worker.hardware_info = hardware_info;
         Ok(worker)
     }
 
@@ -140,6 +167,7 @@ pub struct JobManager {
     config: Arc<Config>,
     cancel_tx: mpsc::UnboundedSender<Uuid>,
     cancel_rx: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Uuid>>>,
+    hardware_status: tokio::sync::RwLock<Value>,
 }
 
 impl JobManager {
@@ -157,7 +185,14 @@ impl JobManager {
             config,
             cancel_tx,
             cancel_rx: tokio::sync::Mutex::new(Some(cancel_rx)),
+            hardware_status: tokio::sync::RwLock::new(
+                json!({"status":"starting","inferenceTestPassed":false}),
+            ),
         }
+    }
+
+    pub async fn hardware_status(&self) -> Value {
+        self.hardware_status.read().await.clone()
     }
 
     /// On API restart, RUNNING means the process died without a durable result;
@@ -195,13 +230,13 @@ impl JobManager {
             .expect("job manager runs once");
         let mut worker: Option<WorkerProcess> = None;
         let mut restart_attempt = 0_u32;
-        let mut last_expiry_sweep = Instant::now() - Duration::from_secs(61);
+        let mut last_expiry_sweep = Instant::now() - self.config.project_ttl;
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
-            if last_expiry_sweep.elapsed() >= Duration::from_secs(60) {
-                if let Err(error) = crate::services::storage::cleanup_expired_audio(
+            if last_expiry_sweep.elapsed() >= self.config.project_ttl {
+                if let Err(error) = crate::services::storage::cleanup_expired_projects(
                     &self.db,
                     &self.config.upload_dir,
                 )
@@ -214,12 +249,14 @@ impl JobManager {
             if worker.is_none() {
                 match WorkerProcess::start(&self.config).await {
                     Ok(process) => {
+                        *self.hardware_status.write().await = process.hardware_info.clone();
                         worker = Some(process);
                         tracing::info!(
                             "persistent HTDemucs worker is available; queue dispatch enabled"
                         );
                     }
                     Err(error) => {
+                        *self.hardware_status.write().await = json!({"status":"unavailable","available":false,"inferenceTestPassed":false,"error":error});
                         restart_attempt = restart_attempt.saturating_add(1);
                         let restart_delay = worker_restart_delay(restart_attempt);
                         tracing::error!(error = %error, attempt = restart_attempt, retry_in_ms = restart_delay.as_millis(), "Demucs worker unavailable; jobs remain durable and queued");
@@ -557,6 +594,10 @@ impl JobManager {
         {
             Ok(true) => Ok(()),
             Ok(false) => {
+                let _ = sqlx::query("DELETE FROM project_segments WHERE job_id=$1")
+                    .bind(job.id)
+                    .execute(&self.db)
+                    .await;
                 remove_new_assets(&newly_persisted).await;
                 Ok(())
             }
@@ -592,6 +633,10 @@ impl JobManager {
                     }
                     return Ok(());
                 }
+                let _ = sqlx::query("DELETE FROM project_segments WHERE job_id=$1")
+                    .bind(job.id)
+                    .execute(&self.db)
+                    .await;
                 remove_new_assets(&newly_persisted).await;
                 let _ = sqlx::query("UPDATE beat_analyses SET status='FAILED',error_message=$2,finished_at=now(),updated_at=now() WHERE separation_job_id=$1 AND input_stem='drums' AND status='RUNNING'")
                     .bind(job.id).bind(&error).execute(&self.db).await;
@@ -809,12 +854,6 @@ impl JobManager {
         .await;
         tracing::info!(job_id = %job_id, stage = "ANALYSIS_PERSISTENCE", beat_count = beat_grid["analysis"]["beats"].as_array().map_or(0, Vec::len), downbeat_count = beat_grid["analysis"]["downbeats"].as_array().map_or(0, Vec::len), "beat grid persistence started");
 
-        let result_metadata = json!({
-            "schemaVersion": 1,
-            "projectId": project_id,
-            "analysisUrl": format!("/api/v1/jobs/{job_id}/analysis"),
-            "stems": persisted_stems
-        });
         let stem_records: Vec<(String, String, i32, i16, i64, i64)> = STEMS
             .iter()
             .map(|stem| {
@@ -832,6 +871,38 @@ impl JobManager {
                 )
             })
             .collect();
+
+        self.stage_progress(
+            job_id,
+            "SEGMENT_GENERATION",
+            99.55,
+            "Preparing aligned audio segments".into(),
+        )
+        .await;
+        let Some(segment_count) = self
+            .generate_project_segments(
+                job_id,
+                project_id,
+                sample_rate,
+                channels,
+                frame_count,
+                &beat_grid,
+                &project_root,
+                &stem_records,
+                newly_persisted,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let result_metadata = json!({
+            "schemaVersion": 1,
+            "projectId": project_id,
+            "analysisUrl": format!("/api/v1/jobs/{job_id}/analysis"),
+            "stems": persisted_stems,
+            "segmentsManifestUrl": format!("/api/v1/projects/{project_id}/segments"),
+            "segmentCount": segment_count
+        });
 
         let mut tx =
             self.db.begin().await.map_err(|error| {
@@ -897,6 +968,128 @@ impl JobManager {
         );
         tracing::info!(job_id = %job_id, project_id = %project_id, stage = "COMPLETED", elapsed_ms = started.elapsed().as_millis(), "project stem set and beat grid committed");
         Ok(true)
+    }
+
+    async fn generate_project_segments(
+        &self,
+        job_id: Uuid,
+        project_id: Uuid,
+        sample_rate: u32,
+        channels: u16,
+        frames: u64,
+        beat_grid: &Value,
+        project_root: &std::path::Path,
+        stem_records: &[(String, String, i32, i16, i64, i64)],
+        newly_persisted: &mut Vec<std::path::PathBuf>,
+    ) -> Result<Option<usize>, String> {
+        let ranges = crate::services::segments::ranges_from_beat_grid(beat_grid, frames);
+        let downbeats = beat_grid
+            .pointer("/analysis/downbeats")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut sources = std::collections::HashMap::new();
+        for record in stem_records {
+            let path =
+                crate::services::project_storage::resolve_storage_key(project_root, &record.1)?;
+            sources.insert(record.0.as_str(), path);
+        }
+        for (index, range) in ranges.iter().enumerate() {
+            if self.cancel_finalization_if_requested(job_id).await {
+                return Ok(None);
+            }
+            let segment_started = Instant::now();
+            let id = crate::services::segments::segment_id(job_id, index);
+            let bar_number = downbeats
+                .iter()
+                .position(|event| {
+                    event.get("samplePosition").and_then(Value::as_u64) == Some(range.start_sample)
+                })
+                .map(|value| value as i32 + 1);
+            sqlx::query("INSERT INTO project_segments (project_id,job_id,segment_index,segment_id,bar_number,start_sample,end_sample,sample_rate,channels,frame_count,audio_format,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'wav','PENDING') ON CONFLICT (project_id,segment_index) DO UPDATE SET status='PENDING',stems='{}'::jsonb,updated_at=now()")
+                .bind(project_id).bind(job_id).bind(index as i32).bind(&id).bind(bar_number).bind(range.start_sample as i64).bind(range.end_sample as i64).bind(sample_rate as i32).bind(channels as i16).bind((range.end_sample-range.start_sample) as i64)
+                .execute(&self.db).await.map_err(|error| format!("create segment manifest entry: {error}"))?;
+            sqlx::query("UPDATE project_segments SET status='PROCESSING',updated_at=now() WHERE project_id=$1 AND segment_index=$2")
+                .bind(project_id).bind(index as i32).execute(&self.db).await.map_err(|error| format!("mark segment processing: {error}"))?;
+            let mut stem_assets = serde_json::Map::new();
+            for stem in ["drums", "bass", "other", "vocals"] {
+                let source = sources
+                    .get(stem)
+                    .ok_or_else(|| format!("missing persisted {stem} source stem"))?;
+                let key = format!("{project_id}/segments/{id}/{stem}.wav");
+                let destination =
+                    crate::services::project_storage::resolve_storage_key(project_root, &key)?;
+                let (byte_length, checksum) = crate::services::segments::write_wav_segment(
+                    source,
+                    &destination,
+                    *range,
+                    sample_rate,
+                    channels,
+                )
+                .await?;
+                newly_persisted.push(destination);
+                stem_assets.insert(
+                    stem.to_owned(),
+                    json!({
+                        "url": format!("/api/v1/projects/{project_id}/segments/{id}/{stem}"),
+                        "storageKey": key,
+                        "sampleRate": sample_rate,
+                        "channels": channels,
+                        "frameCount": range.end_sample-range.start_sample,
+                        "audioFormat": "wav",
+                        "byteLength": byte_length,
+                        "sha256": checksum
+                    }),
+                );
+            }
+            let assets = Value::Object(stem_assets);
+            sqlx::query("UPDATE project_segments SET stems=$3,status='READY',updated_at=now() WHERE project_id=$1 AND segment_index=$2")
+                .bind(project_id).bind(index as i32).bind(&assets).execute(&self.db).await.map_err(|error| format!("publish ready segment manifest: {error}"))?;
+            let progress = 99.55 + 0.35 * ((index + 1) as f64 / ranges.len().max(1) as f64);
+            self.stage_progress(
+                job_id,
+                "SEGMENT_GENERATION",
+                progress,
+                format!(
+                    "Generated aligned segment {} of {}",
+                    index + 1,
+                    ranges.len()
+                ),
+            )
+            .await;
+            let payload = json!({
+                "segmentId": id,
+                "projectId": project_id,
+                "jobId": job_id,
+                "segmentIndex": index,
+                "barNumber": bar_number,
+                "startSample": range.start_sample,
+                "endSample": range.end_sample,
+                "startTime": range.start_sample as f64 / f64::from(sample_rate),
+                "endTime": range.end_sample as f64 / f64::from(sample_rate),
+                "durationSeconds": (range.end_sample-range.start_sample) as f64 / f64::from(sample_rate),
+                "sampleRate": sample_rate,
+                "channels": channels,
+                "frameCount": range.end_sample-range.start_sample,
+                "audioFormat": "wav",
+                "status": "READY",
+                "stems": assets
+            });
+            let _ = self.events.send(JobEvent {
+                event: "segment.ready".into(),
+                stage: Some("SEGMENT_GENERATION".into()),
+                stem: None,
+                stem_metadata: None,
+                chunk: Some(payload),
+                analysis: None,
+                job_id,
+                status: "RUNNING".into(),
+                progress,
+                message: Some(format!("Aligned segment {} is ready", index + 1)),
+            });
+            tracing::info!(%job_id, %project_id, segment_index=index, start_sample=range.start_sample, end_sample=range.end_sample, elapsed_ms=segment_started.elapsed().as_millis(), "synchronized project segment generated");
+        }
+        Ok(Some(ranges.len()))
     }
 
     async fn cancel_finalization_if_requested(&self, id: Uuid) -> bool {

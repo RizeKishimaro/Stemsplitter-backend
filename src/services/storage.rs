@@ -130,66 +130,80 @@ pub fn jobs_root(upload_dir: &Path) -> PathBuf {
         .join("jobs")
 }
 
-/// Remove only terminal-job audio whose configured expiry has elapsed.
-/// Rows for currently queued/running work and uploads referenced by any live
-/// job are never selected. Expired metadata is deleted after its files.
-pub async fn cleanup_expired_audio(pool: &PgPool, upload_dir: &Path) -> Result<(), String> {
+/// Remove expired projects and their owned assets. A deletion marker is claimed
+/// under a row lock first, so concurrent cleanup loops and project writes cannot
+/// race. Files are removed before the cascading database delete; failures clear
+/// the marker so a later sweep can retry.
+pub async fn cleanup_expired_projects(pool: &PgPool, upload_dir: &Path) -> Result<(), String> {
     cleanup_incomplete(upload_dir)
         .await
         .map_err(|error| format!("remove incomplete upload files: {error}"))?;
-    sqlx::query("UPDATE processing_jobs SET status='CANCELLED',cancel_requested=true,finished_at=now(),updated_at=now() WHERE status='QUEUED' AND expires_at <= now()")
-        .execute(pool)
+    let mut tx = pool
+        .begin()
         .await
-        .map_err(|error| format!("expire abandoned queued jobs: {error}"))?;
-    let expired_jobs = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM processing_jobs WHERE expires_at <= now() AND status IN ('SUCCEEDED','FAILED','CANCELLED') ORDER BY expires_at LIMIT 100",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("query expired jobs: {error}"))?;
-    for (job_id,) in expired_jobs {
-        let Some(_cleanup_lease) = begin_audio_cleanup(job_id) else {
+        .map_err(|error| format!("begin project cleanup claim: {error}"))?;
+    let projects = sqlx::query_as::<_, (Uuid,)>("SELECT p.id FROM projects p WHERE p.expires_at<=now() AND (p.deleting_at IS NULL OR p.deleting_at<now()-interval '10 minutes') AND NOT EXISTS (SELECT 1 FROM processing_jobs j WHERE j.project_id=p.id AND j.status IN ('QUEUED','RUNNING')) ORDER BY p.expires_at LIMIT 100 FOR UPDATE SKIP LOCKED")
+        .fetch_all(&mut *tx).await.map_err(|error| format!("claim expired projects: {error}"))?;
+    for (project_id,) in &projects {
+        sqlx::query("UPDATE projects SET deleting_at=now() WHERE id=$1")
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| format!("mark project for cleanup: {error}"))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit project cleanup claims: {error}"))?;
+    for (project_id,) in projects {
+        let Some(_cleanup_lease) = begin_audio_cleanup(project_id) else {
+            let _ = sqlx::query("UPDATE projects SET deleting_at=NULL WHERE id=$1")
+                .bind(project_id)
+                .execute(pool)
+                .await;
             continue;
         };
-        let job_dir = jobs_root(upload_dir).join(job_id.to_string());
-        match fs::remove_dir_all(&job_dir).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(%job_id, %error, "expired temporary job files could not be removed");
-                continue;
-            }
-        }
-        sqlx::query("DELETE FROM processing_jobs WHERE id=$1 AND expires_at <= now() AND status IN ('SUCCEEDED','FAILED','CANCELLED')")
-            .bind(job_id)
-            .execute(pool)
-            .await
-            .map_err(|error| format!("delete expired job metadata: {error}"))?;
-    }
-
-    let expired_assets = sqlx::query_as::<_, (Uuid, Uuid, String)>(
-        "SELECT id, project_id, original_filename FROM audio_assets a WHERE expires_at <= now() AND NOT EXISTS (SELECT 1 FROM processing_jobs j WHERE j.audio_asset_id=a.id) ORDER BY expires_at LIMIT 100",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("query expired uploads: {error}"))?;
-    for (asset_id, project_id, filename) in expired_assets {
-        if let Some(extension) = safe_extension(&filename) {
-            let path = upload_path(upload_dir, project_id, asset_id, extension);
-            match fs::remove_file(path).await {
+        let jobs =
+            sqlx::query_as::<_, (Uuid,)>("SELECT id FROM processing_jobs WHERE project_id=$1")
+                .bind(project_id)
+                .fetch_all(pool)
+                .await
+                .map_err(|error| format!("read project jobs for cleanup: {error}"))?;
+        let mut cleanup_ok = true;
+        for (job_id,) in jobs {
+            match fs::remove_dir_all(jobs_root(upload_dir).join(job_id.to_string())).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    tracing::warn!(%asset_id, %error, "expired upload could not be removed");
-                    continue;
+                    tracing::warn!(%project_id, %job_id, %error, "project job directory cleanup failed");
+                    cleanup_ok = false;
                 }
             }
         }
-        sqlx::query("DELETE FROM audio_assets WHERE id=$1 AND expires_at <= now() AND NOT EXISTS (SELECT 1 FROM processing_jobs WHERE audio_asset_id=$1)")
-            .bind(asset_id)
-            .execute(pool)
-            .await
-            .map_err(|error| format!("delete expired upload metadata: {error}"))?;
+        for directory in [
+            upload_dir.join(project_id.to_string()),
+            crate::services::project_storage::projects_root(upload_dir)
+                .join(project_id.to_string()),
+        ] {
+            match fs::remove_dir_all(&directory).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(%project_id, path=%directory.display(), %error, "project asset directory cleanup failed");
+                    cleanup_ok = false;
+                }
+            }
+        }
+        if cleanup_ok {
+            sqlx::query("DELETE FROM projects WHERE id=$1 AND deleting_at IS NOT NULL AND expires_at<=now() AND NOT EXISTS (SELECT 1 FROM processing_jobs WHERE project_id=$1 AND status IN ('QUEUED','RUNNING'))")
+                .bind(project_id).execute(pool).await.map_err(|error| format!("delete expired project metadata: {error}"))?;
+            tracing::info!(%project_id, "expired project and files cleaned");
+        } else {
+            sqlx::query("UPDATE projects SET deleting_at=NULL WHERE id=$1")
+                .bind(project_id)
+                .execute(pool)
+                .await
+                .map_err(|error| format!("release project cleanup claim: {error}"))?;
+        }
     }
     Ok(())
 }

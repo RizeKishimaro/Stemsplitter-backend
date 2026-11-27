@@ -45,6 +45,24 @@ pub async fn list_stems(
     let job_id = parse_job_id(&job_id)?;
     let job = get_job(&state, job_id).await?;
     require_succeeded(Some(job.status.as_str()))?;
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        job.project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        job.project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
     let rows = sqlx::query_as::<_, ProjectStem>("SELECT project_id,job_id,stem_name,storage_key,sample_rate,channels,frame_count,file_size_bytes,created_at FROM project_stems WHERE job_id=$1 ORDER BY stem_name")
         .bind(job_id).fetch_all(&state.db).await?;
     let response = if rows.is_empty() {
@@ -96,7 +114,7 @@ pub async fn get_stem(
     let range_header = headers
         .get(header::RANGE)
         .map(|value| value.to_str().unwrap_or(""));
-    let lease = storage::acquire_audio_stream(job_id).ok_or(AppError::NotFound)?;
+    let lease = storage::acquire_audio_stream(job.project_id).ok_or(AppError::NotFound)?;
     stream_stem_with_lease(&path, range_header, Some(lease)).await
 }
 
@@ -120,7 +138,16 @@ pub async fn get_project_stem(
     let range_header = headers
         .get(header::RANGE)
         .map(|value| value.to_str().unwrap_or(""));
-    let lease = storage::acquire_audio_stream(row.job_id).ok_or(AppError::NotFound)?;
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
+    let lease = storage::acquire_audio_stream(project_id).ok_or(AppError::NotFound)?;
     stream_stem_with_lease(&path, range_header, Some(lease)).await
 }
 
@@ -170,6 +197,15 @@ pub(crate) async fn stream_stem_with_lease(
     range_header: Option<&str>,
     lease: Option<storage::AudioFileLease>,
 ) -> Result<Response<Body>, AppError> {
+    stream_file_with_lease(path, range_header, "audio/wav", lease).await
+}
+
+pub(crate) async fn stream_file_with_lease(
+    path: &Path,
+    range_header: Option<&str>,
+    content_type: &str,
+    lease: Option<storage::AudioFileLease>,
+) -> Result<Response<Body>, AppError> {
     let file_size = fs::metadata(&path).await.map_err(map_missing_file)?.len();
     let byte_range = match parse_byte_range(range_header, file_size) {
         Ok(value) => value,
@@ -209,7 +245,11 @@ pub(crate) async fn stream_stem_with_lease(
     let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     let response_headers = response.headers_mut();
-    response_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response_headers.insert(header::CONTENT_LENGTH, header_value(length)?);
     if let Some(range) = byte_range {

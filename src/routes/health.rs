@@ -17,3 +17,8 @@ pub async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse
         database: "ok",
     }))
 }
+
+#[utoipa::path(get, path = "/api/v1/system/hardware", responses((status = 200, description = "Selected Demucs runtime and verified device capability")))]
+pub async fn hardware(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(state.jobs.hardware_status().await)
+}

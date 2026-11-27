@@ -118,6 +118,7 @@ Environment variables are loaded by the backend configuration.
 | `DATABASE_MAX_CONNECTIONS` | `10` | SQLx connection pool limit |
 | `UPLOAD_DIR` | `./data/uploads` | Temporary upload storage |
 | `AUDIO_JOB_TTL_SECS` | `86400` | Retention period for temporary uploads and terminal job metadata |
+| `PROJECT_TTL_SECS` | `36000` | Sliding lifetime for server-managed projects (10 hours) |
 | `MAX_UPLOAD_BYTES` | `1073741824` | Maximum upload size (1 GiB) |
 | `JOB_CONCURRENCY` | `1` | Job concurrency; must remain one with the single-model worker |
 | `JOB_POLL_INTERVAL_MS` | `500` | Durable queue polling interval |
@@ -257,8 +258,13 @@ Errors use the following structure:
 | GET | `/api/v1/health` | Liveness response |
 | POST | `/api/v1/projects` | Create a project |
 | GET | `/api/v1/projects/:project_id` | Retrieve project metadata |
+| PUT | `/api/v1/projects/:project_id` | Save validated project arrangement and timeline state |
 | GET | `/api/v1/projects/:project_id/analysis` | Retrieve saved beat-grid JSON |
 | GET | `/api/v1/projects/:project_id/stems/:stem_name` | Stream a persistent WAV stem |
+| GET | `/api/v1/projects/:project_id/audio/:asset_id` | Stream original project audio (Range supported) |
+| GET | `/api/v1/projects/:project_id/segments` | Retrieve segment manifest, including progressive readiness |
+| GET | `/api/v1/projects/:project_id/segments/:segment_id/:stem_name` | Stream one ready stem segment |
+| GET | `/api/v1/system/hardware` | Retrieve the Demucs backend validated at startup |
 | POST | `/api/v1/projects/:project_id/audio` | Upload original audio |
 | GET | `/api/v1/projects/:project_id/audio` | List audio metadata |
 
@@ -619,5 +625,3 @@ The Beat This! integration uses `beat-this` 1.1.0 and its pure-Rust RTen runtime
 Model weights are not included in the source repository. HTDemucs is downloaded through the Hugging Face model cache, while the Beat This! model files are provisioned by the setup manager.
 
 Verify upstream model-weight licensing and redistribution rights before packaging or distributing model assets.
-
-

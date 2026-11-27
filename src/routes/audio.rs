@@ -48,6 +48,15 @@ pub async fn list_audio(
     if !exists {
         return Err(AppError::NotFound);
     }
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
     let rows = sqlx::query_as::<_, AudioListItem>("SELECT id, project_id, original_filename, content_type, file_size_bytes, sample_rate, channels, frame_count, duration_seconds, created_at, updated_at, expires_at FROM audio_assets WHERE project_id = $1 ORDER BY created_at DESC")
         .bind(project_id).fetch_all(&state.db).await?;
     Ok(Json(rows))
@@ -61,6 +70,15 @@ pub async fn upload_audio(
 ) -> Result<Json<AudioAsset>, AppError> {
     let project_id = Uuid::parse_str(&project_id)
         .map_err(|_| AppError::BadRequest("project_id must be a UUID".into()))?;
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
     let mut multipart =
         multipart.map_err(|_| AppError::BadRequest("Malformed multipart upload".into()))?;
     let exists =
@@ -235,10 +253,62 @@ pub async fn upload_audio(
         .bind(validated.sample_rate as i32).bind(validated.channels as i16).bind(validated.frame_count as i64)
         .bind(validated.duration_seconds()).bind(expires_at).fetch_one(&state.db).await;
     match result {
-        Ok(asset) => Ok(Json(asset)),
+        Ok(asset) => {
+            sqlx::query("UPDATE projects SET last_activity_at=now(),expires_at=now()+($2 * interval '1 second'),updated_at=now() WHERE id=$1 AND deleting_at IS NULL")
+                .bind(project_id).bind(i64::try_from(state.config.project_ttl.as_secs()).unwrap_or(i64::MAX)).execute(&state.db).await?;
+            Ok(Json(asset))
+        }
         Err(error) => {
             let _ = fs::remove_file(&destination_path).await;
             Err(AppError::Database(error))
         }
     }
+}
+
+#[utoipa::path(get, path = "/api/v1/projects/{project_id}/audio/{asset_id}", params(("project_id" = Uuid, Path), ("asset_id" = Uuid, Path), ("Range" = Option<String>, Header)), responses((status = 200, description = "Original project audio", content_type = "audio/*"), (status = 206, description = "Partial original audio"), (status = 410, description = "Project expired"), (status = 416, description = "Invalid byte range")))]
+pub async fn get_original_audio(
+    State(state): State<AppState>,
+    AxumPath((raw_project, raw_asset)): AxumPath<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::http::Response<axum::body::Body>, AppError> {
+    let project_id = Uuid::parse_str(&raw_project)
+        .map_err(|_| AppError::BadRequest("project_id must be a UUID".into()))?;
+    let asset_id = Uuid::parse_str(&raw_asset)
+        .map_err(|_| AppError::BadRequest("asset_id must be a UUID".into()))?;
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
+    let asset = sqlx::query_as::<_, AudioAsset>("SELECT id,project_id,original_filename,content_type,stored_path,file_size_bytes,sample_rate,channels,frame_count,duration_seconds,created_at,updated_at,expires_at FROM audio_assets WHERE id=$1 AND project_id=$2")
+        .bind(asset_id).bind(project_id).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
+    let path = tokio::fs::canonicalize(&asset.stored_path)
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AppError::Gone
+            } else {
+                AppError::Io(error)
+            }
+        })?;
+    let upload_root = tokio::fs::canonicalize(&state.config.upload_dir)
+        .await
+        .map_err(AppError::Io)?;
+    let projects_root = crate::services::project_storage::projects_root(&state.config.upload_dir);
+    let projects_root = tokio::fs::canonicalize(projects_root)
+        .await
+        .map_err(AppError::Io)?;
+    if !path.starts_with(&upload_root) && !path.starts_with(&projects_root) {
+        return Err(AppError::NotFound);
+    }
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let lease = crate::services::storage::acquire_audio_stream(project_id).ok_or(AppError::Gone)?;
+    crate::routes::stems::stream_file_with_lease(&path, range, &asset.content_type, Some(lease))
+        .await
 }

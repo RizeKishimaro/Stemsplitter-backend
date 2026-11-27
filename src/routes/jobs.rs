@@ -26,6 +26,15 @@ pub async fn create_job(
 ) -> Result<(axum::http::StatusCode, Json<ProcessingJob>), AppError> {
     let project_id = Uuid::parse_str(&project_id)
         .map_err(|_| AppError::BadRequest("project_id must be a UUID".into()))?;
+    if !crate::services::project_activity::touch_project(
+        &state.db,
+        project_id,
+        state.config.project_ttl,
+    )
+    .await?
+    {
+        return Err(AppError::Gone);
+    }
     let Json(input) = body.map_err(|_| AppError::BadRequest("Invalid JSON request body".into()))?;
     if input.job_type != "separate" {
         return Err(AppError::BadRequest("job_type must be 'separate'".into()));

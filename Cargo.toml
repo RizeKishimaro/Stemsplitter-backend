@@ -1,6 +1,6 @@
 [package]
 name = "soniclab-backend"
-version = "10.2.2"
+version = "10.3.0"
 edition = "2024"
 publish = false
 

@@ -2504,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "soniclab-backend"
-version = "10.2.2"
+version = "10.3.0"
 dependencies = [
  "anyhow",
  "axum",

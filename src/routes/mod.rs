@@ -3,6 +3,7 @@ pub mod beat_analysis;
 pub mod health;
 pub mod jobs;
 pub mod projects;
+pub mod segments;
 pub mod stems;
 
 use axum::{
@@ -24,11 +25,17 @@ use crate::{services::job_manager::JobEvent, state::AppState};
     ),
     paths(
         health::health,
+        health::hardware,
         projects::create_project,
+        projects::list_projects,
         projects::get_project,
+        projects::save_project_state,
         projects::get_project_analysis,
+        segments::list_project_segments,
+        segments::get_project_segment,
         audio::upload_audio,
         audio::list_audio,
+        audio::get_original_audio,
         jobs::create_job,
         jobs::get_job,
         jobs::cancel_job,
@@ -48,8 +55,15 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
     let upload_limit = max_upload_bytes.saturating_add(128 * 1024);
     Router::new()
         .route("/health", get(health::health))
-        .route("/projects", post(projects::create_project))
-        .route("/projects/{project_id}", get(projects::get_project))
+        .route("/system/hardware", get(health::hardware))
+        .route(
+            "/projects",
+            get(projects::list_projects).post(projects::create_project),
+        )
+        .route(
+            "/projects/{project_id}",
+            get(projects::get_project).put(projects::save_project_state),
+        )
         .route(
             "/projects/{project_id}/analysis",
             get(projects::get_project_analysis),
@@ -63,6 +77,18 @@ pub fn router(state: AppState, max_upload_bytes: usize) -> Router {
             post(audio::upload_audio)
                 .get(audio::list_audio)
                 .layer(DefaultBodyLimit::max(upload_limit)),
+        )
+        .route(
+            "/projects/{project_id}/audio/{asset_id}",
+            get(audio::get_original_audio),
+        )
+        .route(
+            "/projects/{project_id}/segments",
+            get(segments::list_project_segments),
+        )
+        .route(
+            "/projects/{project_id}/segments/{segment_id}/{stem_name}",
+            get(segments::get_project_segment),
         )
         .route("/projects/{project_id}/jobs", post(jobs::create_job))
         .route("/jobs/{job_id}", get(jobs::get_job))
