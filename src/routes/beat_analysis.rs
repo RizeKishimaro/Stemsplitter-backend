@@ -320,13 +320,14 @@ async fn execute_analysis(
     .await;
 
     let inference_started = Instant::now();
+    let analysis_input_stem = input_stem.clone();
     let work = tokio::task::spawn_blocking(move || {
         analyze_wav(
             &audio_path,
             sample_rate,
             channels,
             frame_count,
-            &input_stem,
+            &analysis_input_stem,
             &mel_model,
             &beat_model,
             model_version,
@@ -357,7 +358,7 @@ async fn execute_analysis(
             }
         }
         Ok(Err(message)) => {
-            tracing::warn!(%analysis_id, %message, "drum beat analysis failed");
+            tracing::warn!(%analysis_id, %message, "beat analysis failed");
             let _ = sqlx::query("UPDATE beat_analyses SET status = 'FAILED', error_message = $2, finished_at = now(), updated_at = now() WHERE id = $1")
                 .bind(analysis_id).bind(message).execute(&db).await;
         }
